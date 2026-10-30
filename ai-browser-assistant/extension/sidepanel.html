@@ -44,6 +44,7 @@
         }
 
         input,
+        textarea,
         button {
             width: 100%;
             min-height: 44px;
@@ -51,10 +52,16 @@
             font: inherit;
         }
 
-        input {
+        input,
+        textarea {
             padding: 10px 12px;
             border: 1px solid #c8cfdb;
             background: #fff;
+        }
+
+        textarea {
+            min-height: 88px;
+            resize: vertical;
         }
 
         button {
@@ -81,7 +88,8 @@
         }
 
         button:focus-visible,
-        input:focus-visible {
+        input:focus-visible,
+        textarea:focus-visible {
             outline: 3px solid #91adff;
             outline-offset: 2px;
         }
@@ -121,6 +129,15 @@
             white-space: pre-wrap;
         }
 
+        #pageAnswer {
+            max-height: 320px;
+            overflow: auto;
+            padding: 12px;
+            border-radius: 8px;
+            background: #fff;
+            white-space: pre-wrap;
+        }
+
         #interactiveElements {
             padding-left: 20px;
         }
@@ -157,6 +174,11 @@
 
                 <h3>Interactive elements</h3>
                 <ul id="interactiveElements"></ul>
+
+                <label for="pageQuestion">Ask AI about this page</label>
+                <textarea id="pageQuestion" maxlength="1000" placeholder="Ask a question about the webpage"></textarea>
+                <button id="askPage" type="button">Ask about page</button>
+                <p id="pageAnswer" role="status" aria-live="polite" hidden></p>
             </div>
         </section>
     </main>

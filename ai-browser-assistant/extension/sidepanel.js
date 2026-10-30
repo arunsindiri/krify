@@ -8,6 +8,10 @@ const pageTitleDisplay = document.getElementById("pageTitle");
 const pageUrlDisplay = document.getElementById("pageUrl");
 const pageTextDisplay = document.getElementById("pageText");
 const interactiveElementsDisplay = document.getElementById("interactiveElements");
+const pageQuestionInput = document.getElementById("pageQuestion");
+const askPageButton = document.getElementById("askPage");
+const pageAnswerDisplay = document.getElementById("pageAnswer");
+let currentObservation = null;
 
 runTaskButton.addEventListener("click", async () => {
     const instruction = instructionInput.value.trim();
@@ -74,7 +78,67 @@ observePageButton.addEventListener("click", async () => {
     }
 });
 
+askPageButton.addEventListener("click", async () => {
+    const question = pageQuestionInput.value.trim();
+    if (!question) {
+        pageAnswerDisplay.textContent = "Enter a question about the webpage.";
+        pageAnswerDisplay.hidden = false;
+        return;
+    }
+
+    if (!currentObservation) {
+        pageAnswerDisplay.textContent = "Observe a webpage before asking a question.";
+        pageAnswerDisplay.hidden = false;
+        return;
+    }
+
+    askPageButton.disabled = true;
+    pageAnswerDisplay.textContent = "Getting an answer...";
+    pageAnswerDisplay.hidden = false;
+
+    try {
+        const response = await fetch("http://127.0.0.1:8000/ask-page", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                question,
+                page: {
+                    title: currentObservation.title.slice(0, 300),
+                    url: currentObservation.url.slice(0, 2048),
+                    visible_text: currentObservation.visibleText.slice(0, 12000),
+                    interactive_elements: currentObservation.interactiveElements
+                        .slice(0, 100)
+                        .map(element => ({
+                            type: element.type.slice(0, 40),
+                            label: element.label.slice(0, 200),
+                            ...(element.placeholder
+                                ? { placeholder: element.placeholder.slice(0, 200) }
+                                : {}),
+                            ...(element.href
+                                ? { href: element.href.slice(0, 2048) }
+                                : {})
+                        }))
+                }
+            })
+        });
+
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.detail || `Server returned status ${response.status}`);
+        }
+
+        pageAnswerDisplay.textContent = data.answer;
+    } catch (error) {
+        pageAnswerDisplay.textContent = `Unable to answer this question: ${error.message}`;
+    } finally {
+        askPageButton.disabled = false;
+    }
+});
+
 function displayObservation(observation) {
+    currentObservation = observation;
     pageTitleDisplay.textContent = observation.title || "Untitled page";
     pageUrlDisplay.textContent = observation.url;
     pageTextDisplay.textContent = observation.visibleText || "No visible text found.";

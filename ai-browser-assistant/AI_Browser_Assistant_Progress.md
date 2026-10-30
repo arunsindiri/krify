@@ -9,36 +9,37 @@ The current working end-to-end example is opening a website from a natural-langu
 - `Open GitHub`
 - `Take me to Google`
 
-> **Current scope:** The project can interpret instructions to open websites and can manually observe the active page from the Side Panel. Searching websites, clicking page elements, and more advanced automation have not been implemented yet.
+> **Current scope:** The project can interpret instructions to open websites, observe the active page, and answer questions using the observed page information. Searching websites, clicking page elements, and more advanced automation have not been implemented yet.
 
 ## Current Architecture
 
 ```text
-User enters an instruction
+User enters an instruction or observes a page
           |
           v
-Chrome Extension Popup (HTML + JavaScript)
+Chrome Extension Side Panel
           |
           | POST /task with JSON
           v
 Python Backend (FastAPI)
           |
-          | Sends instruction to Groq
+          | Sends instruction or bounded page context to Groq
           v
 Groq AI Model
           |
-          | Returns JSON action
+          | Returns action or answer
           v
-FastAPI returns the action to the extension
+FastAPI returns the result to the extension
           |
-          v
-Extension opens the returned URL in a new Chrome tab
+          +--> Extension opens a returned URL
+          |
+          +--> Side Panel displays the answer
 ```
 
 ## Technology Stack
 
 - **Browser extension:** Chrome Extension, Manifest V3
-- **Popup UI:** HTML and JavaScript
+- **Side Panel UI:** HTML, CSS, and JavaScript
 - **Backend:** Python and FastAPI
 - **ASGI server:** Uvicorn
 - **AI provider:** Groq API
@@ -80,6 +81,8 @@ The exact structure may include generated folders such as `__pycache__/`. These 
 
 To observe a page, the Side Panel sends a message to the service worker. The toolbar click explicitly opens the panel from the `chrome.action.onClicked` handler, preserving the user gesture that grants `activeTab` access. The worker injects `content.js` into the active tab using `chrome.scripting`, requests the observation, and returns it to the panel. Page content is displayed locally and is not sent to the backend.
 
+To ask a question about the page, the user first observes it and enters a question in the Side Panel. The panel sends the observation and question to `POST /ask-page`; the backend limits the page context to 16,000 characters, sends it to Groq, and returns the answer. The Groq API key remains on the backend.
+
 ## Current API
 
 ### `GET /`
@@ -117,6 +120,31 @@ Example response (wording can vary):
 ```
 
 For a request outside the currently supported scope, the AI is instructed to return an `unknown` action with a message that the task cannot yet be performed.
+
+### `POST /ask-page`
+
+Accepts a question and a bounded webpage observation.
+
+Example request:
+
+```json
+{
+  "question": "What is this page about?",
+  "page": {
+    "title": "Example page",
+    "url": "https://example.com/",
+    "visible_text": "Visible page text",
+    "interactive_elements": [
+      {
+        "type": "button",
+        "label": "Learn more"
+      }
+    ]
+  }
+}
+```
+
+The backend validates the request fields and bounds the page information sent to Groq. The endpoint returns `{"answer": "..."}`.
 
 ## Setup and Run
 
@@ -222,6 +250,8 @@ If a real API key has ever been committed or shared publicly, revoke it and gene
 - Connected the extension Side Panel to the Python backend using `fetch()`.
 - Added user-triggered webpage observation for the active tab, including visible text and visible buttons, links, and input controls.
 - Added the least-privilege `activeTab` and `scripting` permissions for on-demand observation.
+- Added the `POST /ask-page` endpoint and Side Panel question UI for Groq-powered answers grounded in observed page information.
+- Limited webpage context sent to Groq to 16,000 characters and kept the API key exclusively in the backend.
 - Verified that the backend receives and returns the user's instruction.
 - Created a separate Groq connectivity test in `test_groq.py`.
 - Resolved the model-not-found error by switching to `openai/gpt-oss-120b`.
@@ -231,7 +261,7 @@ If a real API key has ever been committed or shared publicly, revoke it and gene
 
 ## Known Limitations and Next Steps
 
-The project is an early working prototype. It can open websites and display a user-requested observation of the active page, but it does not search pages or interact with page elements.
+The project is an early working prototype. It can open websites, display a user-requested observation, and answer questions about that observation, but it does not search pages or interact with page elements.
 
 Potential next steps:
 1. Add stronger validation for AI-generated actions and URLs before opening them.
