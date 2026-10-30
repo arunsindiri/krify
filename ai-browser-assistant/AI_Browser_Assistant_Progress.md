@@ -82,11 +82,11 @@ The exact structure may include generated folders such as `__pycache__/`. These 
 7. If the response action is `open_website`, the extension uses `chrome.tabs.create()` to open the returned URL in a new tab.
 8. If the action is not supported, the extension displays the message returned by the backend.
 
-To observe a page, the Side Panel sends a message to the service worker. The toolbar click explicitly opens the panel from the `chrome.action.onClicked` handler, preserving the user gesture that grants `activeTab` access. The worker injects `content.js` into the active tab using `chrome.scripting`, requests the observation, and returns it to the panel.
+To observe a page, the Side Panel keeps its active tab URL and access state synchronized before the user clicks Observe. If the site origin is not already granted and there is no toolbar-click `activeTab` grant for that tab, the click handler immediately calls `chrome.permissions.request()` for only that origin, before any asynchronous tab lookup or injection. It verifies the returned grant with `chrome.permissions.contains()`, then asks the service worker to inject `content.js` into the same tab and origin. A short-lived `storage.session` record preserves toolbar-click fallback state across service-worker restarts and is cleared on navigation or tab close. The manifest declares optional HTTP(S) host patterns, but does not grant access to all sites. Chrome settings, the Chrome Web Store, and other non-web pages are rejected before a permission request.
 
 To ask a question about the page, the user first observes it and enters a question in the Side Panel. The panel sends the observation and question to `POST /ask-page`; the backend limits the page context to 16,000 characters, sends it to Groq, and returns the answer. The Groq API key remains on the backend.
 
-For search automation, the Side Panel sends the query and observed page to `POST /search-plan`. The backend builds form-scoped candidates and sends Groq only observed eligible search inputs with submit buttons from that same form. This avoids confusing the search submit button with unrelated page controls. The backend validates returned indices; invalid selections return a clear `cannot_search` response rather than an unexplained server error. The Side Panel checks the plan and asks the user to confirm it. The service worker forwards the structured action to `content.js`, which rechecks the target and submits only a same-origin GET search form. The panel observes the page again and calls `POST /verify-search` to classify whether results appeared. AI output is never executed as code.
+For search automation, the Side Panel sends the query and observed page to `POST /search-plan`. The backend builds form-scoped candidates and sends Groq only observed eligible search inputs with submit buttons from that same form. This avoids confusing the search submit button with unrelated page controls. The backend validates returned indices; invalid selections return a clear `cannot_search` response rather than an unexplained server error. The Side Panel checks the plan and asks the user to confirm it. The service worker forwards the structured action to `content.js`, which rechecks the target and submits only a same-origin GET search form. The panel observes the page again and calls `POST /verify-search`. Verification checks that the requested query matches the search URL or current search input, then requires result containers/links or an explicit no-results message. A URL change by itself is reported as uncertain. AI output is never executed as code.
 
 ## Current API
 
@@ -157,7 +157,7 @@ Accepts a search query and page observation. Returns a structured `search` plan 
 
 ### `POST /verify-search`
 
-Accepts the query and before/after observations. Returns a bounded verification status: `results_found`, `no_results`, or `uncertain`.
+Accepts the query and before/after observations. The post-search observation may include bounded `search_input_values`, `search_result_container_count`, and `search_result_links` evidence collected from visible page controls and generic result-like containers. Returns `results_found` only when the query matches and result evidence exists, `no_results` when a matching query has an explicit no-results message, and otherwise `uncertain`. A matching URL alone is not enough to claim success.
 
 ## Setup and Run
 
@@ -263,9 +263,11 @@ If a real API key has ever been committed or shared publicly, revoke it and gene
 - Connected the extension Side Panel to the Python backend using `fetch()`.
 - Added user-triggered webpage observation for the active tab, including visible text and visible buttons, links, and input controls.
 - Added the least-privilege `activeTab` and `scripting` permissions for on-demand observation.
+- Added runtime optional host access scoped to the active site's origin, requested directly in the Observe button's click handler and verified before injection.
 - Added the `POST /ask-page` endpoint and Side Panel question UI for Groq-powered answers grounded in observed page information.
 - Limited webpage context sent to Groq to 16,000 characters and kept the API key exclusively in the backend.
-- Added AI-planned, user-confirmed search automation restricted to observed search fields and same-origin GET forms, followed by a fresh observation and AI result verification.
+- Added AI-planned, user-confirmed search automation restricted to observed search fields and same-origin GET forms, followed by fresh observation and signal-based result verification.
+- Added tests for matching results, explicit no-results, mismatched queries, and URL-only/uncertain observations.
 - Verified that the backend receives and returns the user's instruction.
 - Created a separate Groq connectivity test in `test_groq.py`.
 - Resolved the model-not-found error by switching to `openai/gpt-oss-120b`.
@@ -281,7 +283,7 @@ Potential next steps:
 1. Add stronger validation for AI-generated actions and URLs before opening them.
 2. Improve error messages for AI/API/network failures.
 3. Add a `requirements.txt` file for reproducible installation.
-4. Improve result verification for sites that load results asynchronously.
+4. Expand cross-site result-evidence coverage, including pages that load results asynchronously.
 5. Add execution results and validation for the supported browser actions.
 6. Expand toward a plan-execute-observe-validate loop for multi-step tasks.
 

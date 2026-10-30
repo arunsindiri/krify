@@ -209,6 +209,140 @@ class SearchAutomationTests(unittest.TestCase):
         self.assertEqual(response.json()["action"], "open_website")
         self.assertEqual(response.json()["url"], "https://www.youtube.com")
 
+    def test_search_verification_finds_results_from_matching_query_and_result_evidence(self):
+        after_page = {
+            "title": "Search results",
+            "url": "https://www.youtube.com/results?search_query=lofi+music",
+            "visible_text": "Search results for lofi music",
+            "interactive_elements": [],
+            "search_input_values": ["lofi music"],
+            "search_result_container_count": 0,
+            "search_result_links": [
+                {"text": "Lofi music mix", "href": "https://www.youtube.com/watch?v=one"}
+            ],
+        }
+
+        with patch.object(main.client.chat.completions, "create") as create:
+            response = self.client.post(
+                "/verify-search",
+                json={
+                    "query": "lofi music",
+                    "before_page": self.youtube_page,
+                    "after_page": after_page,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "results_found")
+        self.assertIn("result", response.json()["message"].lower())
+        create.assert_not_called()
+
+    def test_search_verification_accepts_result_containers_without_links(self):
+        after_page = {
+            "title": "Search results",
+            "url": "https://example.test/search?q=lofi+music",
+            "visible_text": "Lofi music",
+            "interactive_elements": [],
+            "search_input_values": ["lofi music"],
+            "search_result_container_count": 2,
+        }
+
+        with patch.object(main.client.chat.completions, "create") as create:
+            response = self.client.post(
+                "/verify-search",
+                json={
+                    "query": "lofi music",
+                    "before_page": self.youtube_page,
+                    "after_page": after_page,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "results_found")
+        self.assertIn("2 result container", response.json()["message"])
+        create.assert_not_called()
+
+    def test_search_verification_detects_explicit_no_results_for_matching_query(self):
+        after_page = {
+            "title": "Search results",
+            "url": "https://example.test/search?q=unicorn+astronaut",
+            "visible_text": "No results found for unicorn astronaut.",
+            "interactive_elements": [],
+            "search_input_values": ["unicorn astronaut"],
+        }
+
+        with patch.object(main.client.chat.completions, "create") as create:
+            response = self.client.post(
+                "/verify-search",
+                json={
+                    "query": "unicorn astronaut",
+                    "before_page": self.youtube_page,
+                    "after_page": after_page,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "no_results")
+        self.assertIn("no results", response.json()["message"].lower())
+        create.assert_not_called()
+
+    def test_search_verification_rejects_results_for_a_mismatched_query(self):
+        after_page = {
+            "title": "Search results",
+            "url": "https://www.youtube.com/results?search_query=other+music",
+            "visible_text": "Search results for other music",
+            "interactive_elements": [],
+            "search_input_values": ["other music"],
+            "search_result_container_count": 4,
+            "search_result_links": [
+                {"text": "Other music", "href": "https://www.youtube.com/watch?v=two"}
+            ],
+        }
+
+        with patch.object(
+            main.client.chat.completions,
+            "create",
+            return_value=groq_response(
+                '{"status":"results_found","message":"Results are visible."}'
+            ),
+        ) as create:
+            response = self.client.post(
+                "/verify-search",
+                json={
+                    "query": "lofi music",
+                    "before_page": self.youtube_page,
+                    "after_page": after_page,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "uncertain")
+        self.assertIn("does not match", response.json()["message"].lower())
+        create.assert_not_called()
+
+    def test_search_verification_does_not_trust_url_change_alone(self):
+        after_page = {
+            "title": "Search results",
+            "url": "https://www.youtube.com/results?search_query=lofi+music",
+            "visible_text": "Loading...",
+            "interactive_elements": [],
+        }
+
+        with patch.object(main.client.chat.completions, "create") as create:
+            response = self.client.post(
+                "/verify-search",
+                json={
+                    "query": "lofi music",
+                    "before_page": self.youtube_page,
+                    "after_page": after_page,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "uncertain")
+        self.assertIn("not enough", response.json()["message"].lower())
+        create.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

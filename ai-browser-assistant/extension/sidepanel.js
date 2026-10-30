@@ -15,6 +15,29 @@ const searchQueryInput = document.getElementById("searchQuery");
 const searchPageButton = document.getElementById("searchPage");
 const searchResultDisplay = document.getElementById("searchResult");
 let currentObservation = null;
+let activeTabContext = null;
+let activeTabContextUpdate = 0;
+
+chrome.tabs.onActivated.addListener(() => {
+    void refreshActiveTabContext();
+});
+chrome.tabs.onUpdated.addListener((_tabId, changeInfo) => {
+    if (changeInfo.url || changeInfo.status === "complete") {
+        void refreshActiveTabContext();
+    }
+});
+chrome.permissions.onAdded.addListener(() => {
+    void refreshActiveTabContext();
+});
+chrome.permissions.onRemoved.addListener(() => {
+    void refreshActiveTabContext();
+});
+chrome.runtime.onMessage.addListener((message) => {
+    if (message?.type === "TOOLBAR_ACTIVE_TAB_GRANT_AVAILABLE") {
+        void refreshActiveTabContext();
+    }
+});
+void refreshActiveTabContext();
 
 runTaskButton.addEventListener("click", async () => {
     const instruction = instructionInput.value.trim();
@@ -44,30 +67,102 @@ runTaskButton.addEventListener("click", async () => {
         const data = await response.json();
 
         if (data.action === "open_website") {
-            resultDisplay.textContent = data.message;
-
-            chrome.tabs.create({
+            resultDisplay.textContent = "Opening website in the active tab...";
+            const navigation = await chrome.runtime.sendMessage({
+                type: "NAVIGATE_ACTIVE_TAB",
                 url: data.url
             });
+            if (!navigation?.ok) {
+                throw new Error(navigation?.error || "Unable to navigate the active tab.");
+            }
+            await refreshActiveTabContext();
+            resultDisplay.textContent = data.message || "Opened website in the active tab.";
         } else {
             resultDisplay.textContent = data.message;
         }
 
     } catch (error) {
         resultDisplay.textContent =
-            `Failed to contact backend: ${error.message}`;
+            `Unable to run instruction: ${error.message}`;
     }
 });
 
-observePageButton.addEventListener("click", async () => {
+observePageButton.addEventListener("click", () => {
     observePageButton.disabled = true;
-    observationStatus.textContent = "Reading the active webpage...";
+    const context = activeTabContext;
+    if (!context) {
+        observationStatus.textContent =
+            "The active tab is still being identified. Wait a moment and click Observe active page again.";
+        observePageButton.disabled = false;
+        void refreshActiveTabContext();
+        return;
+    }
+    if (!context.pageUrl) {
+        observationStatus.textContent =
+            "Chrome settings, the Chrome Web Store, and other protected browser pages cannot be observed.";
+        observePageButton.disabled = false;
+        return;
+    }
+
+    let permissionRequest = null;
+    if (!context.hasOriginPermission && !context.hasActiveTabGrant) {
+        const originPattern = `${context.pageUrl.origin}/*`;
+        console.info("Requesting optional host permission", {
+            tabId: context.tabId,
+            origin: context.pageUrl.origin,
+            pattern: originPattern
+        });
+        try {
+            permissionRequest = chrome.permissions.request({
+                origins: [originPattern]
+            });
+        } catch (error) {
+            finishObservationError(error);
+            return;
+        }
+    }
+
+    return observeActiveTab(context, permissionRequest);
+});
+
+async function observeActiveTab(context, permissionRequest) {
+    observationStatus.textContent = permissionRequest
+        ? `Requesting access to ${context.pageUrl.hostname}...`
+        : "Reading the active webpage...";
 
     try {
-        const response = await chrome.runtime.sendMessage({
-            type: "OBSERVE_ACTIVE_TAB"
-        });
+        if (permissionRequest) {
+            let granted;
+            try {
+                granted = await permissionRequest;
+            } catch (error) {
+                console.error("Optional host permission request failed", {
+                    tabId: context.tabId,
+                    origin: context.pageUrl.origin,
+                    error: error.message
+                });
+                throw error;
+            }
+            const originPattern = `${context.pageUrl.origin}/*`;
+            const permissionPresent = await chrome.permissions.contains({
+                origins: [originPattern]
+            });
+            console.info("Optional host permission result", {
+                tabId: context.tabId,
+                origin: context.pageUrl.origin,
+                granted,
+                permissionPresent
+            });
+            if (!granted || !permissionPresent) {
+                if (!context.hasActiveTabGrant) {
+                    throw new Error(
+                        `Access to ${context.pageUrl.hostname} was denied. Grant this site's permission to observe its pages.`
+                    );
+                }
+            }
+        }
 
+        const response = await observeTab(context.tabId, context.pageUrl.origin);
         if (!response?.ok) {
             throw new Error(response?.error || "Unable to observe the active webpage.");
         }
@@ -75,11 +170,109 @@ observePageButton.addEventListener("click", async () => {
         displayObservation(response.observation);
         observationStatus.textContent = "Page observation complete.";
     } catch (error) {
-        observationStatus.textContent = `Unable to observe this page: ${error.message}`;
+        finishObservationError(error);
     } finally {
         observePageButton.disabled = false;
+        void refreshActiveTabContext();
     }
-});
+}
+
+function finishObservationError(error) {
+    observationStatus.textContent = `Unable to observe this page: ${error.message}`;
+    observePageButton.disabled = false;
+}
+
+async function refreshActiveTabContext() {
+    const updateId = ++activeTabContextUpdate;
+    try {
+        const [activeTab] = await chrome.tabs.query({
+            active: true,
+            lastFocusedWindow: true
+        });
+        if (!Number.isInteger(activeTab?.id)) {
+            activeTabContext = null;
+            return;
+        }
+
+        let pageUrl;
+        try {
+            pageUrl = getObservablePageUrl(activeTab.url);
+        } catch {
+            activeTabContext = {
+                tabId: activeTab.id,
+                pageUrl: null,
+                hasOriginPermission: false,
+                hasActiveTabGrant: false
+            };
+            return;
+        }
+
+        const originPattern = `${pageUrl.origin}/*`;
+        const [hasOriginPermission, access] = await Promise.all([
+            chrome.permissions.contains({ origins: [originPattern] }),
+            chrome.runtime.sendMessage({
+                type: "GET_OBSERVATION_ACCESS",
+                tabId: activeTab.id,
+                origin: pageUrl.origin
+            })
+        ]);
+        if (updateId !== activeTabContextUpdate) {
+            return;
+        }
+
+        activeTabContext = {
+            tabId: activeTab.id,
+            pageUrl,
+            hasOriginPermission,
+            hasActiveTabGrant: Boolean(access?.activeTabGrant)
+        };
+        console.info("Active tab observation access", {
+            tabId: activeTab.id,
+            origin: pageUrl.origin,
+            hasOriginPermission,
+            hasActiveTabGrant: activeTabContext.hasActiveTabGrant
+        });
+    } catch (error) {
+        if (updateId === activeTabContextUpdate) {
+            activeTabContext = null;
+            console.error("Unable to refresh active tab observation access", {
+                error: error.message
+            });
+        }
+    }
+}
+
+function getObservablePageUrl(value) {
+    let url;
+    try {
+        url = new URL(value);
+    } catch {
+        throw new Error(
+            "This browser page cannot be observed. Open a regular HTTP or HTTPS website and try again."
+        );
+    }
+
+    const hostname = url.hostname.toLowerCase();
+    if (
+        !["http:", "https:"].includes(url.protocol) ||
+        (hostname === "chrome.google.com" && url.pathname.startsWith("/webstore")) ||
+        hostname === "chromewebstore.google.com"
+    ) {
+        throw new Error(
+            "Chrome settings, the Chrome Web Store, and other protected browser pages cannot be observed."
+        );
+    }
+
+    return url;
+}
+
+function observeTab(tabId, expectedOrigin) {
+    return chrome.runtime.sendMessage({
+        type: "OBSERVE_ACTIVE_TAB",
+        tabId,
+        expectedOrigin
+    });
+}
 
 askPageButton.addEventListener("click", async () => {
     const question = pageQuestionInput.value.trim();
@@ -235,7 +428,7 @@ searchPageButton.addEventListener("click", async () => {
             body: JSON.stringify({
                 query,
                 before_page: buildPagePayload(beforeObservation),
-                after_page: buildPagePayload(afterObservation)
+                after_page: buildPagePayload(afterObservation, { includeSearchEvidence: true })
             })
         });
         const verificationData = await verificationResponse.json();
@@ -246,7 +439,7 @@ searchPageButton.addEventListener("click", async () => {
         }
 
         if (!["results_found", "no_results", "uncertain"].includes(verificationData.status)) {
-            throw new Error("The AI returned an invalid search verification.");
+            throw new Error("The search verifier returned an invalid status.");
         }
 
         const resultLabels = {
@@ -307,8 +500,8 @@ function isValidSearchInput(element) {
     );
 }
 
-function buildPagePayload(observation) {
-    return {
+function buildPagePayload(observation, { includeSearchEvidence = false } = {}) {
+    const page = {
         title: observation.title.slice(0, 300),
         url: observation.url.slice(0, 2048),
         visible_text: observation.visibleText.slice(0, 12000),
@@ -334,6 +527,24 @@ function buildPagePayload(observation) {
                     : {})
             }))
     };
+
+    if (includeSearchEvidence) {
+        page.search_input_values = observation.interactiveElements
+            .filter(element => element.search_candidate && typeof element.search_value === "string")
+            .slice(0, 20)
+            .map(element => element.search_value.slice(0, 300));
+        page.search_result_container_count = Number.isInteger(observation.searchResultContainerCount)
+            ? Math.min(Math.max(observation.searchResultContainerCount, 0), 500)
+            : 0;
+        page.search_result_links = (observation.searchResultLinks || [])
+            .slice(0, 50)
+            .map(link => ({
+                text: typeof link.text === "string" ? link.text.slice(0, 200) : "",
+                href: typeof link.href === "string" ? link.href.slice(0, 2048) : ""
+            }));
+    }
+
+    return page;
 }
 
 async function observeAfterSearch() {
