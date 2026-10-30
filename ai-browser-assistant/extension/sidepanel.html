@@ -64,6 +64,11 @@
             resize: vertical;
         }
 
+        #searchQuery {
+            min-height: 44px;
+            resize: none;
+        }
+
         button {
             margin-top: 12px;
             padding: 10px 14px;
@@ -179,6 +184,11 @@
                 <textarea id="pageQuestion" maxlength="1000" placeholder="Ask a question about the webpage"></textarea>
                 <button id="askPage" type="button">Ask about page</button>
                 <p id="pageAnswer" role="status" aria-live="polite" hidden></p>
+
+                <label for="searchQuery">Search this page</label>
+                <input type="text" id="searchQuery" maxlength="300" placeholder="What would you like to search for?">
+                <button id="searchPage" type="button">Search page</button>
+                <p id="searchResult" role="status" aria-live="polite" hidden></p>
             </div>
         </section>
     </main>

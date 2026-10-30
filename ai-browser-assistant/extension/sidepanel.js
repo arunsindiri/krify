@@ -11,6 +11,9 @@ const interactiveElementsDisplay = document.getElementById("interactiveElements"
 const pageQuestionInput = document.getElementById("pageQuestion");
 const askPageButton = document.getElementById("askPage");
 const pageAnswerDisplay = document.getElementById("pageAnswer");
+const searchQueryInput = document.getElementById("searchQuery");
+const searchPageButton = document.getElementById("searchPage");
+const searchResultDisplay = document.getElementById("searchResult");
 let currentObservation = null;
 
 runTaskButton.addEventListener("click", async () => {
@@ -104,23 +107,7 @@ askPageButton.addEventListener("click", async () => {
             },
             body: JSON.stringify({
                 question,
-                page: {
-                    title: currentObservation.title.slice(0, 300),
-                    url: currentObservation.url.slice(0, 2048),
-                    visible_text: currentObservation.visibleText.slice(0, 12000),
-                    interactive_elements: currentObservation.interactiveElements
-                        .slice(0, 100)
-                        .map(element => ({
-                            type: element.type.slice(0, 40),
-                            label: element.label.slice(0, 200),
-                            ...(element.placeholder
-                                ? { placeholder: element.placeholder.slice(0, 200) }
-                                : {}),
-                            ...(element.href
-                                ? { href: element.href.slice(0, 2048) }
-                                : {})
-                        }))
-                }
+                page: buildPagePayload(currentObservation)
             })
         });
 
@@ -134,6 +121,147 @@ askPageButton.addEventListener("click", async () => {
         pageAnswerDisplay.textContent = `Unable to answer this question: ${error.message}`;
     } finally {
         askPageButton.disabled = false;
+    }
+});
+
+searchPageButton.addEventListener("click", async () => {
+    const query = searchQueryInput.value.trim();
+    if (!query) {
+        searchResultDisplay.textContent = "Enter what you want to search for.";
+        searchResultDisplay.hidden = false;
+        return;
+    }
+
+    if (!currentObservation) {
+        searchResultDisplay.textContent = "Observe a webpage before searching it.";
+        searchResultDisplay.hidden = false;
+        return;
+    }
+
+    searchPageButton.disabled = true;
+    searchResultDisplay.textContent = "Finding a search field...";
+    searchResultDisplay.hidden = false;
+    const beforeObservation = currentObservation;
+    let executionResult = null;
+
+    try {
+        const planResponse = await fetch("http://127.0.0.1:8000/search-plan", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                query,
+                page: buildPagePayload(beforeObservation)
+            })
+        });
+        const planData = await planResponse.json();
+        if (!planResponse.ok) {
+            throw new Error(planData.detail || `Server returned status ${planResponse.status}`);
+        }
+
+        if (planData.action !== "search") {
+            searchResultDisplay.textContent = planData.message || "No suitable search field was found.";
+            return;
+        }
+
+        if (planData.query !== query || !Number.isInteger(planData.input_index)) {
+            throw new Error("The AI returned an invalid search target.");
+        }
+
+        const searchInput = beforeObservation.interactiveElements.find(
+            element => element.index === planData.input_index
+        );
+        if (!isValidSearchInput(searchInput)) {
+            throw new Error("The selected search field is not in the current page observation.");
+        }
+
+        let submitButton = null;
+        if (planData.submit_index !== null) {
+            if (!Number.isInteger(planData.submit_index)) {
+                throw new Error("The AI returned an invalid search button.");
+            }
+
+            submitButton = beforeObservation.interactiveElements.find(
+                element => element.index === planData.submit_index
+            );
+            if (
+                !submitButton?.submit_button ||
+                submitButton.form_index !== searchInput.form_index
+            ) {
+                throw new Error("The selected search button does not belong to the search form.");
+            }
+        }
+
+        const fieldDescription = searchInput.label ||
+            searchInput.placeholder ||
+            searchInput.name ||
+            "search field";
+        const submitDescription = submitButton
+            ? `the "${submitButton.label || "submit"}" button`
+            : "the form's default submit action";
+        if (!window.confirm(
+            `Submit "${query}" using ${fieldDescription} and ${submitDescription} on this page?`
+        )) {
+            searchResultDisplay.textContent = "Search cancelled.";
+            return;
+        }
+
+        searchResultDisplay.textContent = "Submitting search...";
+        const execution = await chrome.runtime.sendMessage({
+            type: "EXECUTE_SEARCH",
+            query,
+            expectedUrl: beforeObservation.url,
+            inputIndex: searchInput.index,
+            submitIndex: submitButton?.index ?? null,
+            expectedInput: searchInput,
+            expectedSubmit: submitButton
+        });
+        if (!execution?.ok || typeof execution.result?.message !== "string") {
+            throw new Error(execution?.error || "The search was not submitted.");
+        }
+        executionResult = execution.result;
+
+        searchResultDisplay.textContent = "Search submitted. Checking the results...";
+        await delay(1200);
+        const afterObservation = await observeAfterSearch();
+        displayObservation(afterObservation);
+
+        const verificationResponse = await fetch("http://127.0.0.1:8000/verify-search", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                query,
+                before_page: buildPagePayload(beforeObservation),
+                after_page: buildPagePayload(afterObservation)
+            })
+        });
+        const verificationData = await verificationResponse.json();
+        if (!verificationResponse.ok) {
+            throw new Error(
+                verificationData.detail || `Server returned status ${verificationResponse.status}`
+            );
+        }
+
+        if (!["results_found", "no_results", "uncertain"].includes(verificationData.status)) {
+            throw new Error("The AI returned an invalid search verification.");
+        }
+
+        const resultLabels = {
+            results_found: "Results found",
+            no_results: "No results found",
+            uncertain: "Results could not be verified"
+        };
+        searchResultDisplay.textContent =
+            `${executionResult.message} ${resultLabels[verificationData.status]}: ${verificationData.message}`;
+    } catch (error) {
+        searchResultDisplay.textContent = executionResult
+            ? `${executionResult.message} Results could not be verified: ${error.message}`
+            : `Search automation failed: ${error.message}`;
+    } finally {
+        searchPageButton.disabled = false;
     }
 });
 
@@ -168,4 +296,68 @@ function displayObservation(observation) {
     }
 
     observationDisplay.hidden = false;
+}
+
+function isValidSearchInput(element) {
+    return Boolean(
+        element &&
+        element.searchable &&
+        element.form_index !== null &&
+        (element.type.startsWith("input (") || element.type === "searchbox")
+    );
+}
+
+function buildPagePayload(observation) {
+    return {
+        title: observation.title.slice(0, 300),
+        url: observation.url.slice(0, 2048),
+        visible_text: observation.visibleText.slice(0, 12000),
+        interactive_elements: observation.interactiveElements
+            .slice(0, 100)
+            .map(element => ({
+                type: element.type.slice(0, 40),
+                label: element.label.slice(0, 200),
+                index: element.index,
+                search_candidate: Boolean(element.search_candidate),
+                searchable: Boolean(element.searchable),
+                search_rejection_reason: element.search_rejection_reason?.slice(0, 200) ?? null,
+                input_type: element.input_type?.slice(0, 40) ?? null,
+                name: element.name?.slice(0, 200) ?? null,
+                element_id: element.element_id?.slice(0, 200) ?? null,
+                form_index: element.form_index ?? null,
+                submit_button: Boolean(element.submit_button),
+                ...(element.placeholder
+                    ? { placeholder: element.placeholder.slice(0, 200) }
+                    : {}),
+                ...(element.href
+                    ? { href: element.href.slice(0, 2048) }
+                    : {})
+            }))
+    };
+}
+
+async function observeAfterSearch() {
+    let lastError;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+        try {
+            const response = await chrome.runtime.sendMessage({
+                type: "OBSERVE_ACTIVE_TAB"
+            });
+            if (!response?.ok || !response.observation) {
+                throw new Error(response?.error || "The results page did not return an observation.");
+            }
+            return response.observation;
+        } catch (error) {
+            lastError = error;
+            if (attempt < 5) {
+                await delay(700);
+            }
+        }
+    }
+
+    throw new Error(`Could not observe the page after searching: ${lastError.message}`);
+}
+
+function delay(milliseconds) {
+    return new Promise(resolve => setTimeout(resolve, milliseconds));
 }

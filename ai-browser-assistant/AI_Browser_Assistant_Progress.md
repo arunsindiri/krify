@@ -9,7 +9,7 @@ The current working end-to-end example is opening a website from a natural-langu
 - `Open GitHub`
 - `Take me to Google`
 
-> **Current scope:** The project can interpret instructions to open websites, observe the active page, and answer questions using the observed page information. Searching websites, clicking page elements, and more advanced automation have not been implemented yet.
+> **Current scope:** The project can open websites, observe the active page, answer questions about it, and perform a user-confirmed search through a detected search form. Other page interactions and multi-step automation are not implemented.
 
 ## Current Architecture
 
@@ -19,21 +19,23 @@ User enters an instruction or observes a page
           v
 Chrome Extension Side Panel
           |
-          | POST /task with JSON
+          | POST /task, /ask-page, or search endpoints
           v
 Python Backend (FastAPI)
           |
-          | Sends instruction or bounded page context to Groq
+          | Sends instructions or bounded page context to Groq
           v
 Groq AI Model
           |
-          | Returns action or answer
+          | Returns website action, page answer, or validated search plan
           v
 FastAPI returns the result to the extension
           |
           +--> Extension opens a returned URL
           |
-          +--> Side Panel displays the answer
+          +--> Side Panel displays answers and search results
+          |
+          +--> Content script safely submits a confirmed search form
 ```
 
 ## Technology Stack
@@ -55,7 +57,8 @@ ai-browser-assistant/
 │   ├── .venv/              # Local Python virtual environment (do not commit)
 │   ├── .env                # Groq API key (do not commit)
 │   ├── main.py             # FastAPI endpoints and Groq integration
-│   └── test_groq.py        # Standalone test of Groq API connectivity
+│   ├── test_groq.py        # Standalone test of Groq API connectivity
+│   └── test_search_automation.py  # Search planning validation tests
 ├── extension/
 │   ├── manifest.json       # Chrome extension and Side Panel configuration
 │   ├── background.js       # Opens the Side Panel and relays page-observation requests
@@ -79,9 +82,11 @@ The exact structure may include generated folders such as `__pycache__/`. These 
 7. If the response action is `open_website`, the extension uses `chrome.tabs.create()` to open the returned URL in a new tab.
 8. If the action is not supported, the extension displays the message returned by the backend.
 
-To observe a page, the Side Panel sends a message to the service worker. The toolbar click explicitly opens the panel from the `chrome.action.onClicked` handler, preserving the user gesture that grants `activeTab` access. The worker injects `content.js` into the active tab using `chrome.scripting`, requests the observation, and returns it to the panel. Page content is displayed locally and is not sent to the backend.
+To observe a page, the Side Panel sends a message to the service worker. The toolbar click explicitly opens the panel from the `chrome.action.onClicked` handler, preserving the user gesture that grants `activeTab` access. The worker injects `content.js` into the active tab using `chrome.scripting`, requests the observation, and returns it to the panel.
 
 To ask a question about the page, the user first observes it and enters a question in the Side Panel. The panel sends the observation and question to `POST /ask-page`; the backend limits the page context to 16,000 characters, sends it to Groq, and returns the answer. The Groq API key remains on the backend.
+
+For search automation, the Side Panel sends the query and observed page to `POST /search-plan`. The backend builds form-scoped candidates and sends Groq only observed eligible search inputs with submit buttons from that same form. This avoids confusing the search submit button with unrelated page controls. The backend validates returned indices; invalid selections return a clear `cannot_search` response rather than an unexplained server error. The Side Panel checks the plan and asks the user to confirm it. The service worker forwards the structured action to `content.js`, which rechecks the target and submits only a same-origin GET search form. The panel observes the page again and calls `POST /verify-search` to classify whether results appeared. AI output is never executed as code.
 
 ## Current API
 
@@ -145,6 +150,14 @@ Example request:
 ```
 
 The backend validates the request fields and bounds the page information sent to Groq. The endpoint returns `{"answer": "..."}`.
+
+### `POST /search-plan`
+
+Accepts a search query and page observation. Returns a structured `search` plan with an observed input index and an optional submit-button index, or `cannot_search` if no supported field is found. Groq receives only eligible search fields paired with submit buttons in their own form. The backend rejects any plan index that does not match that candidate set and explains that no action was submitted.
+
+### `POST /verify-search`
+
+Accepts the query and before/after observations. Returns a bounded verification status: `results_found`, `no_results`, or `uncertain`.
 
 ## Setup and Run
 
@@ -252,6 +265,7 @@ If a real API key has ever been committed or shared publicly, revoke it and gene
 - Added the least-privilege `activeTab` and `scripting` permissions for on-demand observation.
 - Added the `POST /ask-page` endpoint and Side Panel question UI for Groq-powered answers grounded in observed page information.
 - Limited webpage context sent to Groq to 16,000 characters and kept the API key exclusively in the backend.
+- Added AI-planned, user-confirmed search automation restricted to observed search fields and same-origin GET forms, followed by a fresh observation and AI result verification.
 - Verified that the backend receives and returns the user's instruction.
 - Created a separate Groq connectivity test in `test_groq.py`.
 - Resolved the model-not-found error by switching to `openai/gpt-oss-120b`.
@@ -261,17 +275,23 @@ If a real API key has ever been committed or shared publicly, revoke it and gene
 
 ## Known Limitations and Next Steps
 
-The project is an early working prototype. It can open websites, display a user-requested observation, and answer questions about that observation, but it does not search pages or interact with page elements.
+The project is an early working prototype. Search automation only supports visible, form-associated search inputs and same-origin GET forms. It does not click arbitrary page elements or execute AI-generated code.
 
 Potential next steps:
 1. Add stronger validation for AI-generated actions and URLs before opening them.
 2. Improve error messages for AI/API/network failures.
 3. Add a `requirements.txt` file for reproducible installation.
-4. Add a small set of supported browser actions beyond opening websites.
-5. Add execution results and validation so the backend can check whether an action succeeded.
+4. Improve result verification for sites that load results asynchronously.
+5. Add execution results and validation for the supported browser actions.
 6. Expand toward a plan-execute-observe-validate loop for multi-step tasks.
 
 The next feature should be chosen and implemented incrementally, testing the complete workflow after each change.
+
+Run the focused search-planning tests from `backend` with:
+
+```powershell
+.\.venv\Scripts\python.exe -B -m unittest test_search_automation -v
+```
 
 ## Important Security Notes
 

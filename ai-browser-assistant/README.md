@@ -243,8 +243,10 @@ We will decide the next implementation step together. Do not start implementing 
 - Ask the user to confirm sensitive or consequential actions, such as submitting forms, sending messages, purchasing, or deleting information.
 - Request only the browser permissions needed for the current feature.
 
-## 7. First Milestone
+## 7. Implemented Milestones
 
-Build and test one complete, minimal task from the extension interface to the backend and back. The first task could be opening a website or summarizing a webpage, depending on which task we choose first.
+The current prototype can open websites, observe the active webpage, answer questions about the observed page, and perform a user-confirmed search through an observed same-origin GET form.
 
-**Next step:** The project owner will choose the first task to implement. We will build only what is needed for that task, test it end to end, and then add features gradually.
+Search automation accepts only structured element indexes selected from the current observation. The extension revalidates the search field and same-form submit button, and never executes AI-generated JavaScript. After submission, it observes the page again and asks the backend to classify the results as found, not found, or uncertain.
+
+Other page interactions, including filling general forms, clicking arbitrary elements, and multi-step automation, remain out of scope until added as separate, tested milestones.
