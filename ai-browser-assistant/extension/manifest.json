@@ -3,8 +3,20 @@
     "name": "AI Browser Assistant",
     "version": "1.0.0",
     "description": "An AI assistant that helps automate browser tasks.",
+    "minimum_chrome_version": "116",
     "action": {
-        "default_popup": "popup.html"
+        "default_title": "Open AI Browser Assistant"
+    },
+    "background": {
+        "service_worker": "background.js"
+    },
+    "permissions": [
+        "sidePanel",
+        "activeTab",
+        "scripting"
+    ],
+    "side_panel": {
+        "default_path": "sidepanel.html"
     },
     "host_permissions": [
         "http://127.0.0.1:8000/*"

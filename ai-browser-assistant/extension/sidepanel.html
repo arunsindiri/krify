@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Browser Assistant</title>
+    <style>
+        :root {
+            color-scheme: light;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            color: #172033;
+            background: #f5f7fb;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            min-width: 240px;
+            min-height: 100vh;
+            margin: 0;
+            padding: 24px 18px;
+        }
+
+        main {
+            width: min(100%, 560px);
+            margin: 0 auto;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 1.35rem;
+        }
+
+        p {
+            line-height: 1.5;
+        }
+
+        label {
+            display: block;
+            margin: 24px 0 8px;
+            font-weight: 600;
+        }
+
+        input,
+        button {
+            width: 100%;
+            min-height: 44px;
+            border-radius: 8px;
+            font: inherit;
+        }
+
+        input {
+            padding: 10px 12px;
+            border: 1px solid #c8cfdb;
+            background: #fff;
+        }
+
+        button {
+            margin-top: 12px;
+            padding: 10px 14px;
+            border: 0;
+            color: #fff;
+            background: #2457d6;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        button:hover {
+            background: #1948bd;
+        }
+
+        button.secondary {
+            color: #172033;
+            background: #e2e8f5;
+        }
+
+        button.secondary:hover {
+            background: #d3dcef;
+        }
+
+        button:focus-visible,
+        input:focus-visible {
+            outline: 3px solid #91adff;
+            outline-offset: 2px;
+        }
+
+        #result,
+        #observationStatus {
+            min-height: 48px;
+            overflow-wrap: anywhere;
+        }
+
+        section {
+            margin-top: 24px;
+            padding-top: 18px;
+            border-top: 1px solid #dce2ec;
+        }
+
+        h2 {
+            margin: 0;
+            font-size: 1.1rem;
+        }
+
+        h3 {
+            margin: 18px 0 6px;
+            font-size: 0.95rem;
+        }
+
+        #pageUrl,
+        #pageText,
+        #interactiveElements {
+            overflow-wrap: anywhere;
+            font-size: 0.9rem;
+        }
+
+        #pageText {
+            max-height: 240px;
+            overflow: auto;
+            white-space: pre-wrap;
+        }
+
+        #interactiveElements {
+            padding-left: 20px;
+        }
+
+        @media (max-width: 320px) {
+            body {
+                padding: 18px 12px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <main>
+        <h1>AI Browser Assistant</h1>
+        <p>What would you like me to do?</p>
+
+        <label for="instruction">Instruction</label>
+        <input type="text" id="instruction" placeholder="For example, open YouTube">
+        <button id="runTask" type="button">Run Task</button>
+
+        <p id="result" role="status" aria-live="polite">Ready for your instruction.</p>
+
+        <section aria-labelledby="observationHeading">
+            <h2 id="observationHeading">Current webpage</h2>
+            <button id="observePage" class="secondary" type="button">Observe active page</button>
+            <p id="observationStatus" role="status" aria-live="polite">Page details will appear here.</p>
+
+            <div id="observation" hidden>
+                <h3 id="pageTitle"></h3>
+                <p id="pageUrl"></p>
+
+                <h3>Visible text</h3>
+                <pre id="pageText"></pre>
+
+                <h3>Interactive elements</h3>
+                <ul id="interactiveElements"></ul>
+            </div>
+        </section>
+    </main>
+    <script src="sidepanel.js"></script>
+</body>
+</html>

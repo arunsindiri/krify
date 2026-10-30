@@ -9,7 +9,7 @@ The current working end-to-end example is opening a website from a natural-langu
 - `Open GitHub`
 - `Take me to Google`
 
-> **Current scope:** The project can interpret instructions to open websites. Searching websites, reading page content, clicking page elements, and more advanced automation have not been implemented yet.
+> **Current scope:** The project can interpret instructions to open websites and can manually observe the active page from the Side Panel. Searching websites, clicking page elements, and more advanced automation have not been implemented yet.
 
 ## Current Architecture
 
@@ -56,9 +56,11 @@ ai-browser-assistant/
 │   ├── main.py             # FastAPI endpoints and Groq integration
 │   └── test_groq.py        # Standalone test of Groq API connectivity
 ├── extension/
-│   ├── manifest.json       # Chrome extension configuration
-│   ├── popup.html          # Popup interface
-│   └── popup.js            # Sends instructions and opens returned URLs
+│   ├── manifest.json       # Chrome extension and Side Panel configuration
+│   ├── background.js       # Opens the Side Panel and relays page-observation requests
+│   ├── content.js          # Reads visible page text and interactive element labels
+│   ├── sidepanel.html      # Full-height Side Panel interface
+│   └── sidepanel.js        # Displays observations and handles assistant instructions
 ├── .gitignore              # Excludes local secrets and environment files
 └── README.md               # Project documentation
 ```
@@ -67,14 +69,16 @@ The exact structure may include generated folders such as `__pycache__/`. These 
 
 ## How the Current Flow Works
 
-1. The user types an instruction into the extension popup.
-2. `popup.js` sends a `POST` request to `http://127.0.0.1:8000/task`.
+1. The user opens the extension Side Panel from the toolbar and types an instruction.
+2. `sidepanel.js` sends a `POST` request to `http://127.0.0.1:8000/task`.
 3. FastAPI receives the instruction using the `TaskRequest` Pydantic model.
 4. The backend sends the instruction to Groq with a system prompt describing the supported action and required JSON response.
 5. Groq returns an action, URL, and message.
 6. The backend parses the AI response as JSON and returns it to the extension.
 7. If the response action is `open_website`, the extension uses `chrome.tabs.create()` to open the returned URL in a new tab.
 8. If the action is not supported, the extension displays the message returned by the backend.
+
+To observe a page, the Side Panel sends a message to the service worker. The toolbar click explicitly opens the panel from the `chrome.action.onClicked` handler, preserving the user gesture that grants `activeTab` access. The worker injects `content.js` into the active tab using `chrome.scripting`, requests the observation, and returns it to the panel. Page content is displayed locally and is not sent to the backend.
 
 ## Current API
 
@@ -187,7 +191,7 @@ http://127.0.0.1:8000/docs
 3. Click **Load unpacked**.
 4. Select the project's `extension` folder:
    `C:\krify\ai-browser-assistant\extension`
-5. Open the extension popup and enter a task such as `Open YouTube`.
+5. Click the extension's toolbar icon to open the Side Panel, then enter a task such as `Open YouTube`.
 
 If you make changes to the extension files, return to `chrome://extensions/` and click the extension's reload icon.
 
@@ -213,8 +217,11 @@ If a real API key has ever been committed or shared publicly, revoke it and gene
 - Built a FastAPI health-check endpoint.
 - Created a `POST /task` endpoint to receive instructions.
 - Tested the backend endpoint using FastAPI's `/docs` interface.
-- Created a Chrome Manifest V3 extension with a popup UI.
-- Connected the extension popup to the Python backend using `fetch()`.
+- Created a Chrome Manifest V3 extension with a Side Panel UI that remains available while browsing.
+- Configured the toolbar icon to open the Side Panel.
+- Connected the extension Side Panel to the Python backend using `fetch()`.
+- Added user-triggered webpage observation for the active tab, including visible text and visible buttons, links, and input controls.
+- Added the least-privilege `activeTab` and `scripting` permissions for on-demand observation.
 - Verified that the backend receives and returns the user's instruction.
 - Created a separate Groq connectivity test in `test_groq.py`.
 - Resolved the model-not-found error by switching to `openai/gpt-oss-120b`.
@@ -224,16 +231,15 @@ If a real API key has ever been committed or shared publicly, revoke it and gene
 
 ## Known Limitations and Next Steps
 
-The project is an early working prototype. The current capabilities are limited to opening websites.
+The project is an early working prototype. It can open websites and display a user-requested observation of the active page, but it does not search pages or interact with page elements.
 
 Potential next steps:
 1. Add stronger validation for AI-generated actions and URLs before opening them.
 2. Improve error messages for AI/API/network failures.
 3. Add a `requirements.txt` file for reproducible installation.
 4. Add a small set of supported browser actions beyond opening websites.
-5. Implement page observation so the assistant can understand the active webpage.
-6. Add execution results and validation so the backend can check whether an action succeeded.
-7. Expand toward a plan-execute-observe-validate loop for multi-step tasks.
+5. Add execution results and validation so the backend can check whether an action succeeded.
+6. Expand toward a plan-execute-observe-validate loop for multi-step tasks.
 
 The next feature should be chosen and implemented incrementally, testing the complete workflow after each change.
 
