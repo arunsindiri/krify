@@ -143,6 +143,22 @@
             white-space: pre-wrap;
         }
 
+        #searchConfirmation {
+            padding: 12px;
+            border: 1px solid #c8cfdb;
+            border-radius: 8px;
+            background: #fff;
+        }
+
+        #searchConfirmation p {
+            margin: 8px 0;
+            overflow-wrap: anywhere;
+        }
+
+        #searchConfirmation button:first-of-type {
+            margin-top: 16px;
+        }
+
         #interactiveElements {
             padding-left: 20px;
         }
@@ -189,6 +205,15 @@
                 <input type="text" id="searchQuery" maxlength="300" placeholder="What would you like to search for?">
                 <button id="searchPage" type="button">Search page</button>
                 <p id="searchResult" role="status" aria-live="polite" hidden></p>
+                <section id="searchConfirmation" aria-labelledby="searchConfirmationHeading" aria-live="polite" hidden>
+                    <h3 id="searchConfirmationHeading">Confirm search</h3>
+                    <p>Website: <span id="searchConfirmationWebsite"></span></p>
+                    <p>Search query: <span id="searchConfirmationQuery"></span></p>
+                    <p>Selected input: <span id="searchConfirmationInput"></span></p>
+                    <p>Submit button: <span id="searchConfirmationSubmit"></span></p>
+                    <button id="confirmSearch" type="button">Confirm Search</button>
+                    <button id="cancelSearch" class="secondary" type="button">Cancel</button>
+                </section>
             </div>
         </section>
     </main>

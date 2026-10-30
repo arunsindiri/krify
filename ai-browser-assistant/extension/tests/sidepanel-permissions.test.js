@@ -123,6 +123,15 @@ function loadSidePanel({
             return result;
         },
         ready: vm.runInContext("refreshActiveTabContext()", vmContext),
+        displayObservation(nextObservation) {
+            return vmContext.displayObservation(nextObservation);
+        },
+        handleLifecycleMessage(message) {
+            return vm.runInContext(
+                `handlePageObservationLifecycleMessage(${JSON.stringify(message)})`,
+                vmContext
+            );
+        },
         tabEvents: { activatedListeners, updatedListeners },
         permissionEvents: { permissionAddedListeners, permissionRemovedListeners },
         runtimeMessageListeners
@@ -244,6 +253,61 @@ test("refreshes toolbar activeTab fallback when the panel is already open", asyn
         calls.messages.filter(message => message.type === "OBSERVE_ACTIVE_TAB").length,
         1
     );
+});
+
+test("clears stale page state and displays the fresh observation after reload", async () => {
+    const activeTab = {
+        id: 25,
+        url: observation.url
+    };
+    const { elements, ready, displayObservation, handleLifecycleMessage } = loadSidePanel({
+        activeTab,
+        observeResponses: []
+    });
+    await ready;
+    displayObservation(observation);
+
+    await handleLifecycleMessage({
+        type: "PAGE_OBSERVATION_INVALIDATED",
+        tabId: activeTab.id
+    });
+    assert.equal(elements.get("observation").hidden, true);
+    assert.match(elements.get("observationStatus").textContent, /changed/i);
+
+    const refreshedObservation = {
+        ...observation,
+        title: "Refreshed page",
+        visibleText: "New document content"
+    };
+    await handleLifecycleMessage({
+        type: "PAGE_OBSERVATION_UPDATED",
+        tabId: activeTab.id,
+        observation: refreshedObservation
+    });
+
+    assert.equal(elements.get("observation").hidden, false);
+    assert.equal(elements.get("pageTitle").textContent, "Refreshed page");
+    assert.equal(elements.get("pageText").textContent, "New document content");
+    assert.match(elements.get("observationStatus").textContent, /refreshed after navigation/i);
+});
+
+test("reports restricted-page and reconnect failures without retaining stale observation", async () => {
+    const activeTab = { id: 26, url: "chrome://settings/" };
+    const { elements, ready, displayObservation, handleLifecycleMessage } = loadSidePanel({
+        activeTab,
+        observeResponses: []
+    });
+    await ready;
+    displayObservation(observation);
+
+    await handleLifecycleMessage({
+        type: "PAGE_OBSERVATION_FAILED",
+        tabId: activeTab.id,
+        error: "This browser page cannot be observed."
+    });
+
+    assert.equal(elements.get("observation").hidden, true);
+    assert.match(elements.get("observationStatus").textContent, /cannot be observed/i);
 });
 
 test("explains when the user denies permission for the active site", async () => {

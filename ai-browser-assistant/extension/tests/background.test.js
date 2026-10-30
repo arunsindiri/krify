@@ -6,11 +6,23 @@ const vm = require("node:vm");
 
 const extensionPath = path.resolve(__dirname, "..");
 
-function loadBackground({ activeTab, scriptInjectionError }) {
+function loadBackground({
+    activeTab,
+    scriptInjectionError,
+    scriptInjectionErrorAfter,
+    hostPermissionGranted = false,
+    tabMessageResponse = {
+        observation: {
+            title: "Test page",
+            url: "https://example.test/"
+        }
+    }
+}) {
     const toolbarClickListeners = [];
     const messageListeners = [];
     const tabUpdatedListeners = [];
     const tabRemovedListeners = [];
+    const tabActivatedListeners = [];
     const calls = {
         panelOpen: [],
         scriptInjection: [],
@@ -51,6 +63,11 @@ function loadBackground({ activeTab, scriptInjectionError }) {
                     tabUpdatedListeners.push(listener);
                 }
             },
+            onActivated: {
+                addListener(listener) {
+                    tabActivatedListeners.push(listener);
+                }
+            },
             onRemoved: {
                 addListener(listener) {
                     tabRemovedListeners.push(listener);
@@ -69,17 +86,20 @@ function loadBackground({ activeTab, scriptInjectionError }) {
             },
             async sendMessage(tabId, message) {
                 calls.tabMessages.push({ tabId, message });
-                return {
-                    observation: {
-                        title: "Test page",
-                        url: "https://example.test/"
-                    }
-                };
+                if (message.type === "INVALIDATE_SEARCH_TARGETS") {
+                    return { ok: true };
+                }
+                return tabMessageResponse;
             }
         },
         storage: {
             session: {
                 async get(key) {
+                    if (Array.isArray(key)) {
+                        return Object.fromEntries(
+                            key.map(item => [item, calls.sessionStorage[item]])
+                        );
+                    }
                     return { [key]: calls.sessionStorage[key] };
                 },
                 async set(values) {
@@ -93,8 +113,11 @@ function loadBackground({ activeTab, scriptInjectionError }) {
         scripting: {
             async executeScript(options) {
                 calls.scriptInjection.push(options);
-                if (scriptInjectionError) {
-                    throw new Error(scriptInjectionError);
+                if (
+                    scriptInjectionError ||
+                    calls.scriptInjection.length > 1 && scriptInjectionErrorAfter
+                ) {
+                    throw new Error(scriptInjectionError || scriptInjectionErrorAfter);
                 }
             }
         }
@@ -102,7 +125,7 @@ function loadBackground({ activeTab, scriptInjectionError }) {
 
     chrome.permissions = {
         async contains() {
-            return false;
+            return hostPermissionGranted;
         }
     };
 
@@ -116,6 +139,7 @@ function loadBackground({ activeTab, scriptInjectionError }) {
     return {
         calls,
         messageListeners,
+        tabActivatedListeners,
         tabRemovedListeners,
         tabUpdatedListeners,
         toolbarClickListeners
@@ -130,6 +154,40 @@ function sendRuntimeMessage(messageListeners, message) {
         }
     });
 }
+
+test("search execution forwards opaque target IDs to the content script", async () => {
+    const activeTab = { id: 45, windowId: 7, url: "https://example.test/" };
+    const targetIds = {
+        inputTargetId: "target-00000000-0000-4000-8000-000000000001",
+        submitTargetId: "target-00000000-0000-4000-8000-000000000002"
+    };
+    const { calls, messageListeners } = loadBackground({
+        activeTab,
+        tabMessageResponse: {
+            ok: true,
+            result: { message: "Search request initiated." }
+        }
+    });
+
+    const response = await sendRuntimeMessage(messageListeners, {
+        type: "EXECUTE_SEARCH",
+        query: "python",
+        expectedUrl: activeTab.url,
+        ...targetIds
+    });
+
+    assert.equal(response.ok, true);
+    assert.deepEqual(
+        JSON.parse(JSON.stringify(calls.tabMessages[0].message)),
+        {
+            type: "EXECUTE_SEARCH",
+            query: "python",
+            expectedUrl: activeTab.url,
+            ...targetIds
+        }
+    );
+    assert.equal(calls.scriptInjection.length, 1);
+});
 
 test("toolbar click opens the side panel on the clicked tab and observation injects into that tab", async () => {
     const activeTab = { id: 41, windowId: 7, url: "https://example.test/" };
@@ -177,12 +235,128 @@ test("toolbar click retains an activeTab fallback only for that tab until naviga
 
     activeTab.url = "https://other.example/";
     tabUpdatedListeners[0](activeTab.id, { url: "https://other.example/" });
+    await new Promise(resolve => setImmediate(resolve));
     const afterNavigation = await sendRuntimeMessage(messageListeners, {
         type: "GET_OBSERVATION_ACCESS",
         tabId: activeTab.id,
         origin: "https://other.example"
     });
     assert.equal(afterNavigation.activeTabGrant, false);
+});
+
+test("reload refreshes observation only for a watched active page with existing permission", async () => {
+    const activeTab = { id: 61, windowId: 7, url: "https://example.test/" };
+    const {
+        calls,
+        messageListeners,
+        tabActivatedListeners,
+        tabUpdatedListeners
+    } = loadBackground({ activeTab, hostPermissionGranted: true });
+
+    const initial = await sendRuntimeMessage(messageListeners, {
+        type: "OBSERVE_ACTIVE_TAB",
+        tabId: activeTab.id,
+        expectedOrigin: "https://example.test"
+    });
+    assert.equal(initial.ok, true);
+    assert.equal(calls.scriptInjection.length, 1);
+
+    tabUpdatedListeners[0](activeTab.id, { status: "loading" });
+    tabUpdatedListeners[0](activeTab.id, { status: "complete" });
+    tabUpdatedListeners[0](activeTab.id, { status: "complete" });
+    tabActivatedListeners[0]({ tabId: activeTab.id });
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(calls.scriptInjection.length, 2);
+    assert.equal(
+        calls.runtimeMessages.some(message => message.type === "PAGE_OBSERVATION_UPDATED"),
+        true
+    );
+    assert.equal(
+        calls.tabMessages.some(({ message }) => message.type === "EXECUTE_SEARCH"),
+        false
+    );
+});
+
+test("navigation to another origin invalidates the watch and does not auto-inject", async () => {
+    const activeTab = { id: 62, windowId: 7, url: "https://example.test/" };
+    const { calls, messageListeners, tabUpdatedListeners } = loadBackground({
+        activeTab,
+        hostPermissionGranted: true
+    });
+    await sendRuntimeMessage(messageListeners, {
+        type: "OBSERVE_ACTIVE_TAB",
+        tabId: activeTab.id,
+        expectedOrigin: "https://example.test"
+    });
+
+    activeTab.url = "https://other.example/";
+    tabUpdatedListeners[0](activeTab.id, { url: activeTab.url });
+    await new Promise(resolve => setImmediate(resolve));
+    tabUpdatedListeners[0](activeTab.id, { status: "complete" });
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(calls.scriptInjection.length, 1);
+    assert.equal(
+        calls.runtimeMessages.some(message =>
+            message.type === "PAGE_OBSERVATION_FAILED" &&
+            /website changed/i.test(message.error)
+        ),
+        true
+    );
+});
+
+test("automatic reconnect reports content-script injection failures", async () => {
+    const activeTab = { id: 63, windowId: 7, url: "https://example.test/" };
+    const { calls, messageListeners, tabUpdatedListeners } = loadBackground({
+        activeTab,
+        hostPermissionGranted: true,
+        scriptInjectionErrorAfter: "Content script reconnect failed."
+    });
+    await sendRuntimeMessage(messageListeners, {
+        type: "OBSERVE_ACTIVE_TAB",
+        tabId: activeTab.id,
+        expectedOrigin: "https://example.test"
+    });
+
+    tabUpdatedListeners[0](activeTab.id, { status: "complete" });
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(calls.scriptInjection.length, 2);
+    assert.equal(
+        calls.runtimeMessages.some(message =>
+            message.type === "PAGE_OBSERVATION_FAILED" &&
+            /reconnect failed/i.test(message.error)
+        ),
+        true
+    );
+});
+
+test("automatic refresh never requests origin permission", async () => {
+    const activeTab = { id: 64, windowId: 7, url: "https://example.test/" };
+    const { calls, messageListeners, tabUpdatedListeners } = loadBackground({
+        activeTab,
+        hostPermissionGranted: false
+    });
+    await sendRuntimeMessage(messageListeners, {
+        type: "OBSERVE_ACTIVE_TAB",
+        tabId: activeTab.id,
+        expectedOrigin: "https://example.test"
+    });
+
+    tabUpdatedListeners[0](activeTab.id, { status: "complete" });
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(calls.scriptInjection.length, 1);
+    assert.equal(
+        calls.runtimeMessages.some(message =>
+            message.type === "PAGE_OBSERVATION_FAILED" &&
+            /click observe active page/i.test(message.error)
+        ),
+        true
+    );
 });
 
 test("observation rejects restricted pages without injecting a content script", async () => {

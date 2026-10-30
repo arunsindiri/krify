@@ -1,4 +1,6 @@
 const ACTIVE_TAB_GRANT_KEY = "toolbarActiveTabGrant";
+const OBSERVATION_WATCHES_KEY = "pageObservationWatches";
+const automaticObservationRefreshes = new Set();
 
 chrome.action.onClicked.addListener((tab) => {
     if (!Number.isInteger(tab?.id)) {
@@ -25,13 +27,24 @@ chrome.action.onClicked.addListener((tab) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if (changeInfo.url || changeInfo.status === "loading") {
+        invalidateTabObservation(tabId);
+    }
     if (changeInfo.url) {
-        clearToolbarGrant(tabId);
+        void refreshTabAccessForUrl(tabId);
+    }
+    if (changeInfo.status === "complete") {
+        void refreshObservedTab(tabId);
     }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
     clearToolbarGrant(tabId);
+    clearObservationWatch(tabId);
+});
+
+chrome.tabs.onActivated.addListener((activeInfo) => {
+    void refreshObservedTab(activeInfo.tabId);
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -105,6 +118,139 @@ async function clearToolbarGrant(tabId) {
     }
 }
 
+async function refreshTabAccessForUrl(tabId) {
+    try {
+        const [stored, tab] = await Promise.all([
+            chrome.storage.session.get([ACTIVE_TAB_GRANT_KEY, OBSERVATION_WATCHES_KEY]),
+            chrome.tabs.get(tabId)
+        ]);
+        const currentUrl = parsePageUrl(tab.url);
+        const grant = stored[ACTIVE_TAB_GRANT_KEY];
+        if (grant?.tabId === tabId && grant.origin !== currentUrl?.origin) {
+            await chrome.storage.session.remove(ACTIVE_TAB_GRANT_KEY);
+        }
+
+        const watches = stored[OBSERVATION_WATCHES_KEY] || {};
+        const watch = watches[tabId];
+        if (watch && watch.origin !== currentUrl?.origin) {
+            delete watches[tabId];
+            await chrome.storage.session.set({ [OBSERVATION_WATCHES_KEY]: watches });
+            await notifySidePanel({
+                type: "PAGE_OBSERVATION_FAILED",
+                tabId,
+                error: "The active website changed. Click Observe active page to observe the new website."
+            });
+        }
+    } catch (error) {
+        console.error("Unable to refresh page access after navigation", {
+            tabId,
+            error: error.message
+        });
+    }
+}
+
+async function setObservationWatch(tabId, origin) {
+    const stored = await chrome.storage.session.get(OBSERVATION_WATCHES_KEY);
+    const watches = stored[OBSERVATION_WATCHES_KEY] || {};
+    watches[tabId] = { origin };
+    await chrome.storage.session.set({ [OBSERVATION_WATCHES_KEY]: watches });
+}
+
+async function clearObservationWatch(tabId) {
+    const stored = await chrome.storage.session.get(OBSERVATION_WATCHES_KEY);
+    const watches = stored[OBSERVATION_WATCHES_KEY] || {};
+    if (watches[tabId]) {
+        delete watches[tabId];
+        await chrome.storage.session.set({ [OBSERVATION_WATCHES_KEY]: watches });
+    }
+}
+
+function invalidateTabObservation(tabId) {
+    chrome.tabs.sendMessage(tabId, { type: "INVALIDATE_SEARCH_TARGETS" })
+        .catch((error) => {
+            console.debug("Page target invalidation was unavailable:", {
+                tabId,
+                error: error.message
+            });
+        });
+    notifySidePanel({
+        type: "PAGE_OBSERVATION_INVALIDATED",
+        tabId
+    });
+}
+
+async function refreshObservedTab(tabId) {
+    if (automaticObservationRefreshes.has(tabId)) {
+        return;
+    }
+
+    automaticObservationRefreshes.add(tabId);
+    try {
+        const [stored, activeTab] = await Promise.all([
+            chrome.storage.session.get(OBSERVATION_WATCHES_KEY),
+            chrome.tabs.get(tabId)
+        ]);
+        const watch = stored[OBSERVATION_WATCHES_KEY]?.[tabId];
+        if (!watch || activeTab.active === false) {
+            return;
+        }
+
+        const pageUrl = parsePageUrl(activeTab.url);
+        if (!pageUrl || pageUrl.origin !== watch.origin) {
+            await clearObservationWatch(tabId);
+            await notifySidePanel({
+                type: "PAGE_OBSERVATION_FAILED",
+                tabId,
+                error: "This browser page cannot be observed. Click Observe active page on a regular HTTP or HTTPS website."
+            });
+            return;
+        }
+
+        const hasOriginPermission = await chrome.permissions.contains({
+            origins: [`${pageUrl.origin}/*`]
+        });
+        const hasActiveTabGrant = await getToolbarActiveTabGrant(tabId, pageUrl.origin);
+        if (!hasOriginPermission && !hasActiveTabGrant) {
+            await notifySidePanel({
+                type: "PAGE_OBSERVATION_FAILED",
+                tabId,
+                error: `Access to ${pageUrl.hostname} is not available for automatic refresh. Click Observe active page to grant access.`
+            });
+            return;
+        }
+
+        const observation = await observeActiveTab(tabId, pageUrl.origin);
+        if (observation.url !== activeTab.url) {
+            throw new Error("The webpage changed while its observation was refreshing.");
+        }
+        await notifySidePanel({
+            type: "PAGE_OBSERVATION_UPDATED",
+            tabId,
+            observation
+        });
+    } catch (error) {
+        console.error("Unable to refresh the loaded page observation", {
+            tabId,
+            error: error.message
+        });
+        await notifySidePanel({
+            type: "PAGE_OBSERVATION_FAILED",
+            tabId,
+            error: `Unable to refresh webpage observation: ${error.message}`
+        });
+    } finally {
+        automaticObservationRefreshes.delete(tabId);
+    }
+}
+
+async function notifySidePanel(message) {
+    try {
+        await chrome.runtime.sendMessage(message);
+    } catch (error) {
+        console.debug("Side Panel observation notification was unavailable:", error.message);
+    }
+}
+
 async function observeActiveTab(tabId, expectedOrigin) {
     const activeTab = Number.isInteger(tabId)
         ? await chrome.tabs.get(tabId)
@@ -165,6 +311,7 @@ async function observeActiveTab(tabId, expectedOrigin) {
         throw new Error(response?.error || "The page did not return an observation.");
     }
 
+    await setObservationWatch(activeTab.id, pageUrl.origin);
     return response.observation;
 }
 
@@ -242,10 +389,8 @@ async function executeSearch(message) {
         type: "EXECUTE_SEARCH",
         query: message.query,
         expectedUrl: message.expectedUrl,
-        inputIndex: message.inputIndex,
-        submitIndex: message.submitIndex,
-        expectedInput: message.expectedInput,
-        expectedSubmit: message.expectedSubmit
+        inputTargetId: message.inputTargetId,
+        submitTargetId: message.submitTargetId
     });
 
     if (!response?.ok || !response.result) {

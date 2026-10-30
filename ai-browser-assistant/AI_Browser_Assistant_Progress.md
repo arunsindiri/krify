@@ -84,9 +84,11 @@ The exact structure may include generated folders such as `__pycache__/`. These 
 
 To observe a page, the Side Panel keeps its active tab URL and access state synchronized before the user clicks Observe. If the site origin is not already granted and there is no toolbar-click `activeTab` grant for that tab, the click handler immediately calls `chrome.permissions.request()` for only that origin, before any asynchronous tab lookup or injection. It verifies the returned grant with `chrome.permissions.contains()`, then asks the service worker to inject `content.js` into the same tab and origin. A short-lived `storage.session` record preserves toolbar-click fallback state across service-worker restarts and is cleared on navigation or tab close. The manifest declares optional HTTP(S) host patterns, but does not grant access to all sites. Chrome settings, the Chrome Web Store, and other non-web pages are rejected before a permission request.
 
+After a successful manual observation, the service worker tracks that tab for observation refresh. Navigation/loading invalidates its old target IDs and clears the Side Panel's stale observation. Once the active tab finishes loading, the worker reconnects the content script and refreshes the observation only when the same origin remains accessible through an existing host permission or toolbar `activeTab` grant. A page load never triggers a search, other browser action, or AI request; restricted pages, changed origins, and reconnect failures are reported in the Side Panel. Content-script initialization is idempotent, and document unload clears its in-memory target references.
+
 To ask a question about the page, the user first observes it and enters a question in the Side Panel. The panel sends the observation and question to `POST /ask-page`; the backend limits the page context to 16,000 characters, sends it to Groq, and returns the answer. The Groq API key remains on the backend.
 
-For search automation, the Side Panel sends the query and observed page to `POST /search-plan`. The backend builds form-scoped candidates and sends Groq only observed eligible search inputs with submit buttons from that same form. This avoids confusing the search submit button with unrelated page controls. The backend validates returned indices; invalid selections return a clear `cannot_search` response rather than an unexplained server error. The Side Panel checks the plan and asks the user to confirm it. The service worker forwards the structured action to `content.js`, which rechecks the target and submits only a same-origin GET search form. The panel observes the page again and calls `POST /verify-search`. Verification checks that the requested query matches the search URL or current search input, then requires result containers/links or an explicit no-results message. A URL change by itself is reported as uncertain. AI output is never executed as code.
+For search automation, the content script assigns random opaque target IDs to visible interactive elements and keeps a short-lived map to their DOM node references and relevant attribute/form snapshots. The Side Panel sends these IDs with the observation to `POST /search-plan`. The backend builds form-scoped candidates and sends Groq only eligible search-input target IDs and submit-button target IDs from that same observed form. It validates returned IDs against those candidates. The Side Panel confirmation retains the selected IDs, and Confirm forwards them through the service worker. Content script execution resolves IDs only in its private in-memory map, then rejects expired, detached, hidden, disabled, or modified targets and rechecks the same-form association, GET method, same-origin action, target, and submit-button constraints immediately before interacting. Target IDs are single-use; AI output is never treated as JavaScript or a selector. The panel observes the page again and calls `POST /verify-search`. Verification checks that the requested query matches the search URL or current search input, then requires result containers/links or an explicit no-results message. A URL change by itself is reported as uncertain.
 
 ## Current API
 
@@ -267,6 +269,12 @@ If a real API key has ever been committed or shared publicly, revoke it and gene
 - Added the `POST /ask-page` endpoint and Side Panel question UI for Groq-powered answers grounded in observed page information.
 - Limited webpage context sent to Groq to 16,000 characters and kept the API key exclusively in the backend.
 - Added AI-planned, user-confirmed search automation restricted to observed search fields and same-origin GET forms, followed by fresh observation and signal-based result verification.
+- Replaced native search confirmation with a Side Panel confirmation section; pending plans are single-use, cancellable, and invalidated when the page or active tab changes.
+- Added extension tests for search confirmation, cancellation, repeated confirmation clicks, and stale-target rejection.
+- Replaced search-plan positional element selections with random opaque DOM target IDs stored by the content script; execution resolves the original node reference, revalidates its observed attributes and safe form relationship, and consumes IDs on use.
+- Added target-ID validation tests for reordered controls, detached/hidden/disabled/modified targets, expiry, invalid IDs, form changes, and duplicate execution.
+- Added automatic observation refresh after tab navigation/reload, including stale-state invalidation, permission-gated reconnects, restricted-page handling, and Side Panel refresh/error updates without automatic AI or browser actions.
+- Added lifecycle tests for reloads, cross-origin navigation, missing permissions, reconnect failures, content-script reinjection, target invalidation, and Side Panel refresh state.
 - Added tests for matching results, explicit no-results, mismatched queries, and URL-only/uncertain observations.
 - Verified that the backend receives and returns the user's instruction.
 - Created a separate Groq connectivity test in `test_groq.py`.
@@ -290,6 +298,18 @@ Potential next steps:
 The next feature should be chosen and implemented incrementally, testing the complete workflow after each change.
 
 Run the focused search-planning tests from `backend` with:
+
+```powershell
+.\.venv\Scripts\python.exe -B -m unittest test_search_automation -v
+```
+
+Run the Side Panel extension tests from the project root with:
+
+```powershell
+node --test .\ai-browser-assistant\extension\tests\*.test.js
+```
+
+Run backend search automation tests from the backend folder with:
 
 ```powershell
 .\.venv\Scripts\python.exe -B -m unittest test_search_automation -v

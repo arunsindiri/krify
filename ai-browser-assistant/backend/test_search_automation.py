@@ -11,6 +11,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 import main
 
 
+def target_id(index: int) -> str:
+    return f"target-00000000-0000-4000-8000-{index:012x}"
+
+
 def groq_response(content: str):
     return SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
@@ -27,6 +31,7 @@ class SearchAutomationTests(unittest.TestCase):
             "interactive_elements": [
                 {
                     "index": index,
+                    "target_id": target_id(index),
                     "type": "button",
                     "label": f"Unrelated YouTube control {index}",
                     "form_index": index,
@@ -35,6 +40,7 @@ class SearchAutomationTests(unittest.TestCase):
             ] + [
                 {
                     "index": 20,
+                    "target_id": target_id(20),
                     "type": "input (text)",
                     "label": "Search",
                     "placeholder": "Search",
@@ -46,6 +52,7 @@ class SearchAutomationTests(unittest.TestCase):
                 },
                 {
                     "index": 21,
+                    "target_id": target_id(21),
                     "type": "button",
                     "label": "Search",
                     "form_index": 20,
@@ -53,6 +60,7 @@ class SearchAutomationTests(unittest.TestCase):
                 },
                 {
                     "index": 22,
+                    "target_id": target_id(22),
                     "type": "button",
                     "label": "Search suggestions",
                     "form_index": 22,
@@ -65,8 +73,8 @@ class SearchAutomationTests(unittest.TestCase):
         expected_plan = {
             "action": "search",
             "query": "lofi music",
-            "input_index": 20,
-            "submit_index": 21,
+            "input_target_id": target_id(20),
+            "submit_target_id": target_id(21),
             "message": "Use the YouTube search form.",
         }
 
@@ -81,20 +89,21 @@ class SearchAutomationTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["input_index"], 20)
-        self.assertEqual(response.json()["submit_index"], 21)
+        self.assertEqual(response.json()["input_target_id"], target_id(20))
+        self.assertEqual(response.json()["submit_target_id"], target_id(21))
         model_context = create.call_args.kwargs["messages"][1]["content"]
-        self.assertIn('"index": 20', model_context)
-        self.assertIn('"index": 21', model_context)
-        self.assertNotIn('"index": 0', model_context)
-        self.assertNotIn('"index": 22', model_context)
+        self.assertIn(f'"target_id": "{target_id(20)}"', model_context)
+        self.assertIn(f'"target_id": "{target_id(21)}"', model_context)
+        self.assertNotIn('"index":', model_context)
+        self.assertNotIn(f'"target_id": "{target_id(0)}"', model_context)
+        self.assertNotIn(f'"target_id": "{target_id(22)}"', model_context)
 
     def test_unrelated_submit_button_is_rejected_with_actionable_message(self):
         invalid_plan = {
             "action": "search",
             "query": "lofi music",
-            "input_index": 20,
-            "submit_index": 22,
+            "input_target_id": target_id(20),
+            "submit_target_id": target_id(22),
             "message": "Use search.",
         }
 
@@ -117,8 +126,8 @@ class SearchAutomationTests(unittest.TestCase):
         invalid_plan = {
             "action": "search",
             "query": "lofi music",
-            "input_index": 0,
-            "submit_index": 1,
+            "input_target_id": target_id(0),
+            "submit_target_id": target_id(1),
             "message": "Use search.",
         }
 
@@ -136,6 +145,45 @@ class SearchAutomationTests(unittest.TestCase):
         self.assertEqual(response.json()["action"], "cannot_search")
         self.assertIn("not an eligible field", response.json()["message"])
         self.assertIn("Nothing was submitted", response.json()["message"])
+
+    def test_unknown_search_target_id_is_rejected(self):
+        invalid_plan = {
+            "action": "search",
+            "query": "lofi music",
+            "input_target_id": target_id(99),
+            "submit_target_id": target_id(21),
+            "message": "Use search.",
+        }
+
+        with patch.object(
+            main.client.chat.completions,
+            "create",
+            return_value=groq_response(json.dumps(invalid_plan)),
+        ):
+            response = self.client.post(
+                "/search-plan",
+                json={"query": "lofi music", "page": self.youtube_page},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["action"], "cannot_search")
+        self.assertIn("not an eligible field", response.json()["message"])
+        self.assertIsNone(response.json()["input_target_id"])
+
+    def test_duplicate_target_ids_are_rejected(self):
+        page = dict(self.youtube_page)
+        page["interactive_elements"] = [
+            dict(element, target_id=target_id(20))
+            for element in self.youtube_page["interactive_elements"][:2]
+        ]
+
+        response = self.client.post(
+            "/search-plan",
+            json={"query": "lofi music", "page": page},
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("target IDs must be unique", response.text)
 
     def test_unsupported_search_form_is_explained_without_calling_groq(self):
         page = {

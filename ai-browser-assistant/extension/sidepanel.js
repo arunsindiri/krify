@@ -14,14 +14,32 @@ const pageAnswerDisplay = document.getElementById("pageAnswer");
 const searchQueryInput = document.getElementById("searchQuery");
 const searchPageButton = document.getElementById("searchPage");
 const searchResultDisplay = document.getElementById("searchResult");
+const searchConfirmation = document.getElementById("searchConfirmation");
+const searchConfirmationWebsite = document.getElementById("searchConfirmationWebsite");
+const searchConfirmationQuery = document.getElementById("searchConfirmationQuery");
+const searchConfirmationInput = document.getElementById("searchConfirmationInput");
+const searchConfirmationSubmit = document.getElementById("searchConfirmationSubmit");
+const confirmSearchButton = document.getElementById("confirmSearch");
+const cancelSearchButton = document.getElementById("cancelSearch");
 let currentObservation = null;
 let activeTabContext = null;
 let activeTabContextUpdate = 0;
+let pendingSearchConfirmation = null;
+let searchOperationInProgress = false;
 
-chrome.tabs.onActivated.addListener(() => {
+chrome.tabs.onActivated.addListener((activeInfo) => {
+    if (pendingSearchConfirmation?.tabId !== activeInfo.tabId) {
+        discardPendingSearchConfirmation("The active tab changed.");
+    }
     void refreshActiveTabContext();
 });
-chrome.tabs.onUpdated.addListener((_tabId, changeInfo) => {
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if (
+        pendingSearchConfirmation?.tabId === tabId &&
+        (changeInfo.url || changeInfo.status === "complete")
+    ) {
+        discardPendingSearchConfirmation("The webpage changed.");
+    }
     if (changeInfo.url || changeInfo.status === "complete") {
         void refreshActiveTabContext();
     }
@@ -36,8 +54,60 @@ chrome.runtime.onMessage.addListener((message) => {
     if (message?.type === "TOOLBAR_ACTIVE_TAB_GRANT_AVAILABLE") {
         void refreshActiveTabContext();
     }
+    if (
+        message?.type === "PAGE_OBSERVATION_INVALIDATED" ||
+        message?.type === "PAGE_OBSERVATION_UPDATED" ||
+        message?.type === "PAGE_OBSERVATION_FAILED"
+    ) {
+        void handlePageObservationLifecycleMessage(message);
+    }
 });
 void refreshActiveTabContext();
+
+async function handlePageObservationLifecycleMessage(message) {
+    try {
+        const [activeTab] = await chrome.tabs.query({
+            active: true,
+            lastFocusedWindow: true
+        });
+        if (activeTab?.id !== message.tabId) {
+            return;
+        }
+
+        if (message.type === "PAGE_OBSERVATION_UPDATED") {
+            await refreshActiveTabContext();
+            if (
+                activeTabContext?.tabId !== message.tabId ||
+                activeTabContext.pageUrl?.href !== message.observation?.url
+            ) {
+                return;
+            }
+
+            displayObservation(message.observation);
+            observationStatus.textContent = "Page observation refreshed after navigation.";
+            return;
+        }
+
+        currentObservation = null;
+        observationDisplay.hidden = true;
+        if (pendingSearchConfirmation) {
+            discardPendingSearchConfirmation("The webpage navigated.");
+        }
+        observationStatus.textContent = message.type === "PAGE_OBSERVATION_FAILED"
+            ? message.error || "Unable to refresh webpage observation."
+            : "The webpage changed. Its observation will refresh after loading.";
+        void refreshActiveTabContext();
+    } catch (error) {
+        console.error("Unable to update the Side Panel webpage observation", {
+            tabId: message.tabId,
+            error: error.message
+        });
+        if (message.type !== "PAGE_OBSERVATION_INVALIDATED") {
+            observationStatus.textContent =
+                `Unable to refresh webpage observation: ${error.message}`;
+        }
+    }
+}
 
 runTaskButton.addEventListener("click", async () => {
     const instruction = instructionInput.value.trim();
@@ -318,6 +388,10 @@ askPageButton.addEventListener("click", async () => {
 });
 
 searchPageButton.addEventListener("click", async () => {
+    if (searchOperationInProgress || pendingSearchConfirmation) {
+        return;
+    }
+
     const query = searchQueryInput.value.trim();
     if (!query) {
         searchResultDisplay.textContent = "Enter what you want to search for.";
@@ -332,10 +406,10 @@ searchPageButton.addEventListener("click", async () => {
     }
 
     searchPageButton.disabled = true;
+    searchOperationInProgress = true;
     searchResultDisplay.textContent = "Finding a search field...";
     searchResultDisplay.hidden = false;
     const beforeObservation = currentObservation;
-    let executionResult = null;
 
     try {
         const planResponse = await fetch("http://127.0.0.1:8000/search-plan", {
@@ -358,25 +432,28 @@ searchPageButton.addEventListener("click", async () => {
             return;
         }
 
-        if (planData.query !== query || !Number.isInteger(planData.input_index)) {
+        if (
+            planData.query !== query ||
+            typeof planData.input_target_id !== "string"
+        ) {
             throw new Error("The AI returned an invalid search target.");
         }
 
         const searchInput = beforeObservation.interactiveElements.find(
-            element => element.index === planData.input_index
+            element => element.target_id === planData.input_target_id
         );
         if (!isValidSearchInput(searchInput)) {
             throw new Error("The selected search field is not in the current page observation.");
         }
 
         let submitButton = null;
-        if (planData.submit_index !== null) {
-            if (!Number.isInteger(planData.submit_index)) {
+        if (planData.submit_target_id !== null) {
+            if (typeof planData.submit_target_id !== "string") {
                 throw new Error("The AI returned an invalid search button.");
             }
 
             submitButton = beforeObservation.interactiveElements.find(
-                element => element.index === planData.submit_index
+                element => element.target_id === planData.submit_target_id
             );
             if (
                 !submitButton?.submit_button ||
@@ -393,22 +470,71 @@ searchPageButton.addEventListener("click", async () => {
         const submitDescription = submitButton
             ? `the "${submitButton.label || "submit"}" button`
             : "the form's default submit action";
-        if (!window.confirm(
-            `Submit "${query}" using ${fieldDescription} and ${submitDescription} on this page?`
-        )) {
-            searchResultDisplay.textContent = "Search cancelled.";
-            return;
+        pendingSearchConfirmation = {
+            query,
+            expectedUrl: beforeObservation.url,
+            observation: beforeObservation,
+            input: searchInput,
+            submitButton,
+            inputTargetId: searchInput.target_id,
+            submitTargetId: submitButton?.target_id ?? null,
+            tabId: activeTabContext?.tabId
+        };
+        searchConfirmationWebsite.textContent = new URL(beforeObservation.url).hostname;
+        searchConfirmationQuery.textContent = query;
+        searchConfirmationInput.textContent = fieldDescription;
+        searchConfirmationSubmit.textContent = submitDescription;
+        searchConfirmation.hidden = false;
+        searchResultDisplay.textContent = "Review the search details and confirm to continue.";
+    } catch (error) {
+        searchResultDisplay.textContent = `Search automation failed: ${error.message}`;
+    } finally {
+        searchOperationInProgress = false;
+        updateSearchControls();
+    }
+});
+
+confirmSearchButton.addEventListener("click", confirmPendingSearch);
+cancelSearchButton.addEventListener("click", () => {
+    if (searchOperationInProgress || !pendingSearchConfirmation) {
+        return;
+    }
+
+    pendingSearchConfirmation = null;
+    searchConfirmation.hidden = true;
+    searchResultDisplay.textContent = "Search cancelled.";
+    updateSearchControls();
+});
+
+async function confirmPendingSearch() {
+    if (searchOperationInProgress || !pendingSearchConfirmation) {
+        return;
+    }
+
+    const pending = pendingSearchConfirmation;
+    pendingSearchConfirmation = null;
+    searchConfirmation.hidden = true;
+    searchOperationInProgress = true;
+    updateSearchControls();
+
+    let executionResult = null;
+    try {
+        if (
+            currentObservation !== pending.observation ||
+            currentObservation.url !== pending.expectedUrl ||
+            activeTabContext?.tabId !== pending.tabId ||
+            activeTabContext?.pageUrl.href !== pending.expectedUrl
+        ) {
+            throw new Error("The page or search target changed. Observe the page again and retry.");
         }
 
         searchResultDisplay.textContent = "Submitting search...";
         const execution = await chrome.runtime.sendMessage({
             type: "EXECUTE_SEARCH",
-            query,
-            expectedUrl: beforeObservation.url,
-            inputIndex: searchInput.index,
-            submitIndex: submitButton?.index ?? null,
-            expectedInput: searchInput,
-            expectedSubmit: submitButton
+            query: pending.query,
+            expectedUrl: pending.expectedUrl,
+            inputTargetId: pending.inputTargetId,
+            submitTargetId: pending.submitTargetId
         });
         if (!execution?.ok || typeof execution.result?.message !== "string") {
             throw new Error(execution?.error || "The search was not submitted.");
@@ -426,8 +552,8 @@ searchPageButton.addEventListener("click", async () => {
                 "Content-Type": "application/json"
             },
             body: JSON.stringify({
-                query,
-                before_page: buildPagePayload(beforeObservation),
+                query: pending.query,
+                before_page: buildPagePayload(pending.observation),
                 after_page: buildPagePayload(afterObservation, { includeSearchEvidence: true })
             })
         });
@@ -454,11 +580,33 @@ searchPageButton.addEventListener("click", async () => {
             ? `${executionResult.message} Results could not be verified: ${error.message}`
             : `Search automation failed: ${error.message}`;
     } finally {
-        searchPageButton.disabled = false;
+        searchOperationInProgress = false;
+        updateSearchControls();
     }
-});
+}
+
+function discardPendingSearchConfirmation(reason) {
+    if (!pendingSearchConfirmation) {
+        return;
+    }
+
+    pendingSearchConfirmation = null;
+    searchConfirmation.hidden = true;
+    searchResultDisplay.textContent =
+        `Search confirmation discarded: ${reason} Observe the page again before searching.`;
+    updateSearchControls();
+}
+
+function updateSearchControls() {
+    searchPageButton.disabled = searchOperationInProgress || Boolean(pendingSearchConfirmation);
+    confirmSearchButton.disabled = searchOperationInProgress || !pendingSearchConfirmation;
+    cancelSearchButton.disabled = searchOperationInProgress || !pendingSearchConfirmation;
+}
 
 function displayObservation(observation) {
+    if (pendingSearchConfirmation && pendingSearchConfirmation.observation !== observation) {
+        discardPendingSearchConfirmation("A new page observation replaced the search target.");
+    }
     currentObservation = observation;
     pageTitleDisplay.textContent = observation.title || "Untitled page";
     pageUrlDisplay.textContent = observation.url;
@@ -494,6 +642,7 @@ function displayObservation(observation) {
 function isValidSearchInput(element) {
     return Boolean(
         element &&
+        typeof element.target_id === "string" &&
         element.searchable &&
         element.form_index !== null &&
         (element.type.startsWith("input (") || element.type === "searchbox")
@@ -511,6 +660,7 @@ function buildPagePayload(observation, { includeSearchEvidence = false } = {}) {
                 type: element.type.slice(0, 40),
                 label: element.label.slice(0, 200),
                 index: element.index,
+                target_id: element.target_id ?? null,
                 search_candidate: Boolean(element.search_candidate),
                 searchable: Boolean(element.searchable),
                 search_rejection_reason: element.search_rejection_reason?.slice(0, 200) ?? null,
