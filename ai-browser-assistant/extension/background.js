@@ -89,6 +89,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return true;
     }
 
+    if (message?.type === "EXECUTE_APPROVED_CLICK") {
+        executeApprovedClick(message, sender)
+            .then((response) => sendResponse(response))
+            .catch((error) => {
+                sendResponse({
+                    ok: false,
+                    status: error.status || "failed",
+                    error: error.message || "Unable to execute the approved click."
+                });
+            });
+        return true;
+    }
+
     if (message?.type !== "EXECUTE_SEARCH") {
         return false;
     }
@@ -398,6 +411,163 @@ async function executeSearch(message) {
     }
 
     return response.result;
+}
+
+async function executeApprovedClick(message, sender) {
+    if (
+        sender?.id !== chrome.runtime.id ||
+        sender.url !== chrome.runtime.getURL("sidepanel.html")
+    ) {
+        throw clickExecutionError("rejected", "Approved clicks may only be requested by the Side Panel.");
+    }
+
+    const targetId = message.targetId;
+    if (
+        typeof targetId !== "string" ||
+        !/^target-[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(targetId)
+    ) {
+        throw clickExecutionError("rejected", "The approved click target ID is invalid.");
+    }
+    if (
+        !Number.isInteger(message.tabId) ||
+        !Number.isFinite(message.approvalExpiresAt) ||
+        Date.now() >= message.approvalExpiresAt ||
+        message.approvalExpiresAt > Date.now() + 4 * 60 * 1000
+    ) {
+        throw clickExecutionError("rejected", "The click approval is invalid or expired.");
+    }
+
+    const expectedUrl = parsePageUrl(message.expectedUrl);
+    const supportedTypes = new Set(["a", "link", "button", "tab", "input (button)"]);
+    if (
+        !expectedUrl ||
+        expectedUrl.href !== message.expectedUrl ||
+        !supportedTypes.has(message.expectedElementType) ||
+        typeof message.expectedElementText !== "string" ||
+        message.expectedElementText.length > 200 ||
+        (message.expectedHref !== null && typeof message.expectedHref !== "string")
+    ) {
+        throw clickExecutionError("rejected", "The approved click metadata is invalid.");
+    }
+    const expectedLink = message.expectedElementType === "a" ||
+        message.expectedElementType === "link" ||
+        message.expectedHref !== null;
+    if (expectedLink) {
+        if (!isSafeClickHref(message.expectedHref)) {
+            throw clickExecutionError("rejected", "The approved link destination is not safe HTTP or HTTPS.");
+        }
+    } else if (message.expectedHref !== null) {
+        throw clickExecutionError("rejected", "The approved non-link target contains an unexpected destination.");
+    }
+
+    const [activeTab] = await chrome.tabs.query({
+        active: true,
+        lastFocusedWindow: true
+    });
+    if (
+        activeTab?.id !== message.tabId ||
+        activeTab.url !== message.expectedUrl
+    ) {
+        throw clickExecutionError("rejected", "The approved click no longer targets the active page.");
+    }
+
+    const origin = expectedUrl.origin;
+    const hasOriginPermission = await chrome.permissions.contains({
+        origins: [`${origin}/*`]
+    });
+    const hasActiveTabGrant = hasOriginPermission
+        ? false
+        : await getToolbarActiveTabGrant(activeTab.id, origin);
+    if (!hasOriginPermission && !hasActiveTabGrant) {
+        throw clickExecutionError("rejected", "The extension no longer has access to this page.");
+    }
+
+    const [stillActiveTab] = await chrome.tabs.query({
+        active: true,
+        lastFocusedWindow: true
+    });
+    if (
+        stillActiveTab?.id !== message.tabId ||
+        stillActiveTab.url !== message.expectedUrl
+    ) {
+        throw clickExecutionError("rejected", "The active page changed before the click was sent.");
+    }
+
+    let readiness;
+    try {
+        readiness = await chrome.tabs.sendMessage(activeTab.id, {
+            type: "PING_CLICK_EXECUTOR"
+        });
+    } catch {
+        throw clickExecutionError("failed", "The page click executor is unavailable. No click was sent.");
+    }
+    if (!readiness?.ok) {
+        throw clickExecutionError("failed", "The page click executor is unavailable. No click was sent.");
+    }
+
+    const [finalActiveTab] = await chrome.tabs.query({
+        active: true,
+        lastFocusedWindow: true
+    });
+    if (
+        finalActiveTab?.id !== message.tabId ||
+        finalActiveTab.url !== message.expectedUrl
+    ) {
+        throw clickExecutionError("rejected", "The active page changed before the click was sent.");
+    }
+
+    let response;
+    try {
+        response = await chrome.tabs.sendMessage(activeTab.id, {
+            type: "EXECUTE_APPROVED_CLICK",
+            targetId,
+            expectedUrl: message.expectedUrl,
+            expectedElementType: message.expectedElementType,
+            expectedElementText: message.expectedElementText,
+            expectedHref: message.expectedHref,
+            approvalExpiresAt: message.approvalExpiresAt
+        });
+    } catch {
+        return {
+            ok: true,
+            result: {
+                status: "dispatched",
+                uncertain: true,
+                message: "The page changed or disconnected before responding. The click may have been dispatched; do not retry automatically."
+            }
+        };
+    }
+
+    if (response?.ok && response.result?.status === "dispatched") {
+        return { ok: true, result: response.result };
+    }
+    return {
+        ok: false,
+        status: "rejected",
+        error: response?.error || "The page rejected the approved click."
+    };
+}
+
+function clickExecutionError(status, message) {
+    const error = new Error(message);
+    error.status = status;
+    return error;
+}
+
+function isSafeClickHref(value) {
+    if (typeof value !== "string") {
+        return false;
+    }
+
+    try {
+        const url = new URL(value);
+        return ["http:", "https:"].includes(url.protocol) &&
+            Boolean(url.hostname) &&
+            !url.username &&
+            !url.password;
+    } catch {
+        return false;
+    }
 }
 
 async function getActiveTab() {

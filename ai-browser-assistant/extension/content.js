@@ -1,6 +1,9 @@
 if (!(globalThis.aiBrowserSearchTargetStore?.targets instanceof Map)) {
     globalThis.aiBrowserSearchTargetStore = { targets: new Map() };
 }
+if (!globalThis.aiBrowserTargetDocumentToken) {
+    globalThis.aiBrowserTargetDocumentToken = {};
+}
 
 if (!globalThis.aiBrowserObserverInstalled) {
     globalThis.aiBrowserObserverInstalled = true;
@@ -12,6 +15,24 @@ if (!globalThis.aiBrowserObserverInstalled) {
         if (message?.type === "INVALIDATE_SEARCH_TARGETS") {
             globalThis.aiBrowserSearchTargetStore.targets.clear();
             sendResponse({ ok: true });
+            return false;
+        }
+
+        if (message?.type === "PING_CLICK_EXECUTOR") {
+            sendResponse({ ok: true });
+            return false;
+        }
+
+        if (message?.type === "EXECUTE_APPROVED_CLICK") {
+            try {
+                const result = executeApprovedClick(message);
+                sendResponse({ ok: true, result });
+            } catch (error) {
+                sendResponse({
+                    ok: false,
+                    error: error.message || "The page rejected the approved click."
+                });
+            }
             return false;
         }
 
@@ -74,28 +95,26 @@ if (!globalThis.aiBrowserObserverInstalled) {
 function collectInteractiveElements() {
     const targetStore = globalThis.aiBrowserSearchTargetStore.targets;
     targetStore.clear();
-    const candidates = document.querySelectorAll(
+    const candidates = Array.from(document.querySelectorAll(
         'button, a[href], input, textarea, select, [role="button"], [role="link"], [role="searchbox"]'
+    ));
+    const visibilityByElement = new Map(
+        candidates.map(element => [element, isVisibleElement(element)])
+    );
+    candidates.sort((left, right) =>
+        Number(visibilityByElement.get(right)) - Number(visibilityByElement.get(left))
     );
     const descriptors = [];
     let truncated = false;
 
     for (const element of candidates) {
-        const style = window.getComputedStyle(element);
-        if (
-            element.getClientRects().length === 0 ||
-            style.visibility === "hidden" ||
-            style.display === "none" ||
-            style.opacity === "0"
-        ) {
-            continue;
-        }
-
         if (descriptors.length >= 100) {
             truncated = true;
             break;
         }
 
+        const visible = visibilityByElement.get(element) === true;
+        const disabled = getElementDisabledState(element);
         const tagName = element.tagName.toLowerCase();
         const role = element.getAttribute("role");
         const inputType = tagName === "input" ? (element.type || "text").toLowerCase() : null;
@@ -103,6 +122,9 @@ function collectInteractiveElements() {
             ? `input (${inputType})`
             : role || tagName;
         const label = getElementLabel(element);
+        const accessibleName = getAccessibleName(element);
+        const accessibleRole = getAccessibleRole(element);
+        const ancestorContext = getSemanticAncestorContext(element);
         const placeholderValue = element.getAttribute("placeholder");
         const name = element.getAttribute("name");
         const elementId = element.getAttribute("id");
@@ -136,7 +158,15 @@ function collectInteractiveElements() {
                 /\b(search|query)\b/i.test(searchMetadata));
         let searchRejectionReason = null;
         if (searchCandidate) {
-            if (formIndex < 0) {
+            if (!visible) {
+                searchRejectionReason = "search input is not visible";
+            } else if (disabled !== false) {
+                searchRejectionReason = disabled === true
+                    ? "search input is disabled"
+                    : "search input disabled state was not observed";
+            } else if (element.readOnly) {
+                searchRejectionReason = "search input is read-only";
+            } else if (formIndex < 0) {
                 searchRejectionReason = "search input is not associated with a form";
             } else if (formMethod !== "get") {
                 searchRejectionReason = `form method is ${formMethod.toUpperCase()}, not GET`;
@@ -159,10 +189,11 @@ function collectInteractiveElements() {
             "formtarget",
             "formenctype"
         ].some(attribute => element.getAttribute(attribute) !== null);
-        const submitButton = formIndex >= 0 &&
+        const submitButton = visible &&
+            disabled === false &&
+            formIndex >= 0 &&
             !hasSubmitOverrides &&
-            !element.disabled &&
-            !element.matches(":disabled") && (
+            (
             (tagName === "button" && element.type === "submit") ||
             (tagName === "input" && ["submit", "image"].includes(inputType))
         );
@@ -171,6 +202,13 @@ function collectInteractiveElements() {
             target_id: registerSearchTarget(element),
             type,
             label,
+            element_tag: tagName,
+            accessible_role: accessibleRole,
+            accessible_name: accessibleName,
+            landmark_label: ancestorContext.landmarkLabel,
+            ancestor_context: ancestorContext.ancestors,
+            visible,
+            disabled,
             search_candidate: searchCandidate,
             searchable,
             search_rejection_reason: searchRejectionReason,
@@ -228,6 +266,7 @@ function registerSearchTarget(element) {
         targetId,
         element,
         observedUrl: window.location.href,
+        documentToken: globalThis.aiBrowserTargetDocumentToken,
         createdAt: Date.now(),
         snapshot: {
             tagName: element.tagName,
@@ -237,6 +276,11 @@ function registerSearchTarget(element) {
             ariaLabel: element.getAttribute("aria-label"),
             title: element.getAttribute("title"),
             label: getElementLabel(element),
+            accessibleRole: getAccessibleRole(element),
+            accessibleName: getAccessibleName(element),
+            landmarkLabel: getSemanticAncestorContext(element).landmarkLabel,
+            ancestorContext: getSemanticAncestorContext(element).ancestors,
+            href: typeof element.href === "string" ? element.href : null,
             placeholder: element.getAttribute("placeholder"),
             role: element.getAttribute("role"),
             autocomplete: element.getAttribute("autocomplete"),
@@ -301,6 +345,7 @@ function collectSearchResultEvidence() {
 function getElementLabel(element) {
     return (
         element.getAttribute("aria-label") ||
+        getLabelledByText(element) ||
         Array.from(element.labels || [])
             .map(labelElement => labelElement.innerText || labelElement.textContent || "")
             .join(" ") ||
@@ -309,6 +354,114 @@ function getElementLabel(element) {
         element.getAttribute("title") ||
         ""
     ).trim().replace(/\s+/g, " ").slice(0, 200);
+}
+
+function getAccessibleName(element) {
+    return getElementLabel(element);
+}
+
+function getAccessibleRole(element) {
+    const explicitRole = element.getAttribute("role")?.trim().split(/\s+/)[0];
+    if (explicitRole) {
+        return explicitRole.slice(0, 40);
+    }
+
+    const tagName = element.tagName.toLowerCase();
+    if (tagName === "a" && element.getAttribute("href") !== null) {
+        return "link";
+    }
+    if (tagName === "button") {
+        return "button";
+    }
+    if (tagName === "textarea") {
+        return "textbox";
+    }
+    if (tagName === "select") {
+        return element.multiple ? "listbox" : "combobox";
+    }
+    if (tagName === "input") {
+        const inputType = (element.type || "text").toLowerCase();
+        if (inputType === "search") {
+            return "searchbox";
+        }
+        if (["button", "submit", "image"].includes(inputType)) {
+            return "button";
+        }
+        if (inputType === "checkbox" || inputType === "radio") {
+            return inputType;
+        }
+        return "textbox";
+    }
+
+    return tagName.slice(0, 40);
+}
+
+function getLabelledByText(element) {
+    const labelledBy = element.getAttribute("aria-labelledby");
+    if (!labelledBy || typeof document.getElementById !== "function") {
+        return "";
+    }
+
+    return labelledBy
+        .trim()
+        .split(/\s+/)
+        .map(id => document.getElementById(id))
+        .filter(Boolean)
+        .map(labelElement => labelElement.innerText || labelElement.textContent || "")
+        .join(" ")
+        .trim()
+        .replace(/\s+/g, " ")
+        .slice(0, 200);
+}
+
+function getExplicitContextName(element) {
+    return (
+        element.getAttribute("aria-label") ||
+        getLabelledByText(element) ||
+        element.getAttribute("title") ||
+        ""
+    ).trim().replace(/\s+/g, " ").slice(0, 160);
+}
+
+function getSemanticAncestorContext(element) {
+    const landmarkRoles = new Set([
+        "banner",
+        "complementary",
+        "contentinfo",
+        "main",
+        "navigation",
+        "region",
+        "search",
+        "toolbar"
+    ]);
+    const landmarkTags = new Set(["aside", "footer", "header", "main", "nav"]);
+    const ancestors = [];
+    let landmarkLabel = null;
+
+    for (let ancestor = element.parentElement; ancestor && ancestors.length < 4; ancestor = ancestor.parentElement) {
+        const tagName = ancestor.tagName.toLowerCase();
+        const role = ancestor.getAttribute("role")?.trim().split(/\s+/)[0]?.toLowerCase() || "";
+        const name = getExplicitContextName(ancestor);
+        const isLandmark = landmarkRoles.has(role) || landmarkTags.has(tagName);
+        if (!isLandmark && !role && !name) {
+            continue;
+        }
+
+        const parts = [role || tagName];
+        if (name) {
+            parts.push(name);
+        }
+        ancestors.push(parts.join(": ").slice(0, 180));
+
+        if (isLandmark && landmarkLabel === null) {
+            landmarkLabel = name || role || tagName;
+        }
+    }
+
+    return {
+        landmarkLabel,
+        ancestors
+    };
 }
 
 function prepareSearch(message) {
@@ -426,6 +579,140 @@ function resolveSearchTarget(targetId, description) {
     return target;
 }
 
+function executeApprovedClick(message) {
+    const targetId = message.targetId;
+    if (
+        typeof targetId !== "string" ||
+        !/^target-[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(targetId)
+    ) {
+        throw new Error("The approved click target ID is invalid.");
+    }
+    if (
+        typeof message.approvalExpiresAt !== "number" ||
+        !Number.isFinite(message.approvalExpiresAt) ||
+        Date.now() >= message.approvalExpiresAt ||
+        message.approvalExpiresAt > Date.now() + 4 * 60 * 1000
+    ) {
+        throw new Error("The click approval is expired or has an invalid expiry.");
+    }
+    if (message.expectedUrl !== window.location.href) {
+        throw new Error("The approved click belongs to a different page.");
+    }
+
+    const targets = globalThis.aiBrowserSearchTargetStore.targets;
+    const target = targets.get(targetId);
+    if (!target || Date.now() - target.createdAt > 4 * 60 * 1000) {
+        targets.delete(targetId);
+        throw new Error("The approved click target is stale or unavailable.");
+    }
+
+    validateTargetState(target, "click target");
+    validateApprovedClickTarget(target, message);
+
+    targets.delete(targetId);
+    target.element.click();
+
+    return {
+        status: "dispatched",
+        message: "Click event dispatched. The page outcome was not verified."
+    };
+}
+
+function validateApprovedClickTarget(target, message) {
+    const element = target.element;
+    const tagName = element.tagName.toLowerCase();
+    const inputType = tagName === "input" ? (element.type || "text").toLowerCase() : "";
+    const observedType = tagName === "input"
+        ? `input (${inputType})`
+        : element.getAttribute("role") || tagName;
+    const supportedTypes = new Set(["a", "link", "button", "tab", "input (button)"]);
+
+    if (target.documentToken !== globalThis.aiBrowserTargetDocumentToken) {
+        throw new Error("The approved target belongs to another document.");
+    }
+    if (
+        !element.isConnected ||
+        !document.documentElement.contains(element)
+    ) {
+        throw new Error("The approved click target is no longer attached to the page.");
+    }
+    if (!isVisibleElement(element)) {
+        throw new Error("The approved click target is no longer visible.");
+    }
+    if (
+        getElementDisabledState(element) !== false ||
+        (typeof element.matches === "function" && element.matches(":disabled"))
+    ) {
+        throw new Error("The approved click target is disabled or its enabled state is unknown.");
+    }
+    if (!supportedTypes.has(observedType)) {
+        throw new Error("The approved click target type is not supported.");
+    }
+    if (message.expectedElementType !== observedType) {
+        throw new Error("The approved click target type changed since observation.");
+    }
+    if (
+        typeof message.expectedElementText !== "string" ||
+        message.expectedElementText !== getElementLabel(element)
+    ) {
+        throw new Error("The approved click target identity changed since observation.");
+    }
+    if (!matchesTargetSnapshot(target)) {
+        throw new Error("The approved click target identity changed since observation.");
+    }
+    if (isFormSubmitControl(element)) {
+        throw new Error("Form submission controls are not supported for approved clicks.");
+    }
+    if (isUnsafeClickTarget(element)) {
+        throw new Error("The approved click target appears destructive or transaction-related.");
+    }
+
+    const hasAnchorHref = tagName === "a" && element.getAttribute("href") !== null;
+    const requiresSafeHref = hasAnchorHref ||
+        observedType === "a" ||
+        observedType === "link";
+    if (requiresSafeHref) {
+        const href = typeof element.href === "string" ? element.href : "";
+        if (typeof message.expectedHref !== "string" || href !== message.expectedHref) {
+            throw new Error("The approved link destination changed since observation.");
+        }
+
+        let destination;
+        try {
+            destination = new URL(href, window.location.href);
+        } catch {
+            throw new Error("The approved link destination is invalid.");
+        }
+        if (
+            !["http:", "https:"].includes(destination.protocol) ||
+            !destination.hostname ||
+            destination.username ||
+            destination.password
+        ) {
+            throw new Error("Only safe HTTP or HTTPS links can be clicked.");
+        }
+    } else if (message.expectedHref !== null) {
+        throw new Error("The approved non-link target contains an unexpected destination.");
+    }
+}
+
+function isFormSubmitControl(element) {
+    const tagName = element.tagName.toLowerCase();
+    const inputType = tagName === "input" ? (element.type || "").toLowerCase() : "";
+    return (tagName === "button" && (element.type || "submit").toLowerCase() === "submit") ||
+        (tagName === "input" && ["submit", "image"].includes(inputType));
+}
+
+function isUnsafeClickTarget(element) {
+    const descriptiveText = [
+        getElementLabel(element),
+        element.getAttribute("title") || "",
+        element.getAttribute("name") || ""
+    ].join(" ");
+    return /\b(delet\w*|remov\w*|destroy\w*|eras\w*|discard\w*|purchas\w*|buy|bought|payment|pay|check\s*out|checkout|logout|log\s*out|sign\s*out|unsubscribe\w*|cancel\s+(?:an?\s+)?(?:order|purchase|subscription|booking)|(?:close|terminate)\s+(?:an?\s+)?account|place\s+(?:an?\s+)?order)\b/i
+        .test(descriptiveText);
+}
+
 function validateTargetState(target, description) {
     if (Date.now() - target.createdAt > 5 * 60 * 1000) {
         globalThis.aiBrowserSearchTargetStore.targets.delete(target.targetId);
@@ -526,11 +813,64 @@ function validateSubmitTarget(target) {
 }
 
 function isVisibleElement(element) {
-    const style = window.getComputedStyle(element);
-    return element.getClientRects().length > 0 &&
-        style.visibility !== "hidden" &&
-        style.display !== "none" &&
-        style.opacity !== "0";
+    try {
+        if (!element || element.isConnected === false || element.hidden) {
+            return false;
+        }
+
+        const hasVisibleRect = Array.from(element.getClientRects()).some(rect =>
+            rect.width > 0 && rect.height > 0
+        );
+        if (!hasVisibleRect) {
+            return false;
+        }
+
+        for (let ancestor = element; ancestor; ancestor = ancestor.parentElement) {
+            if (ancestor.hidden || ancestor.inert) {
+                return false;
+            }
+
+            const style = window.getComputedStyle(ancestor);
+            const opacity = Number.parseFloat(style.opacity);
+            if (
+                style.visibility === "hidden" ||
+                style.visibility === "collapse" ||
+                style.display === "none" ||
+                style.contentVisibility === "hidden" ||
+                !Number.isFinite(opacity) ||
+                opacity <= 0
+            ) {
+                return false;
+            }
+        }
+
+        if (
+            typeof element.checkVisibility === "function" &&
+            !element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })
+        ) {
+            return false;
+        }
+
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function getElementDisabledState(element) {
+    try {
+        if (element.getAttribute("aria-disabled")?.trim().toLowerCase() === "true") {
+            return true;
+        }
+
+        if (typeof element.matches === "function" && element.matches(":disabled")) {
+            return true;
+        }
+
+        return typeof element.disabled === "boolean" ? element.disabled : false;
+    } catch {
+        return null;
+    }
 }
 
 function matchesTargetSnapshot(target) {
@@ -542,6 +882,12 @@ function matchesTargetSnapshot(target) {
         element.getAttribute("aria-label") === snapshot.ariaLabel &&
         element.getAttribute("title") === snapshot.title &&
         getElementLabel(element) === snapshot.label &&
+        getAccessibleRole(element) === snapshot.accessibleRole &&
+        getAccessibleName(element) === snapshot.accessibleName &&
+        getSemanticAncestorContext(element).landmarkLabel === snapshot.landmarkLabel &&
+        JSON.stringify(getSemanticAncestorContext(element).ancestors) ===
+            JSON.stringify(snapshot.ancestorContext) &&
+        (typeof element.href === "string" ? element.href : null) === snapshot.href &&
         element.getAttribute("placeholder") === snapshot.placeholder &&
         element.getAttribute("role") === snapshot.role &&
         element.getAttribute("autocomplete") === snapshot.autocomplete &&

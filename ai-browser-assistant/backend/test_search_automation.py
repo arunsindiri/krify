@@ -392,5 +392,561 @@ class SearchAutomationTests(unittest.TestCase):
         create.assert_not_called()
 
 
+class ClickAutomationPlanningTests(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(main.app)
+        self.page = {
+            "title": "Account settings",
+            "url": "https://example.test/account",
+            "visible_text": "Account settings",
+            "interactive_elements": [
+                {
+                    "index": 0,
+                    "target_id": target_id(100),
+                    "type": "a",
+                    "label": "Profile",
+                    "href": "https://example.test/profile",
+                    "visible": True,
+                    "disabled": False,
+                },
+                {
+                    "index": 1,
+                    "target_id": target_id(101),
+                    "type": "button",
+                    "label": "Show preferences",
+                    "visible": True,
+                    "disabled": False,
+                },
+            ],
+        }
+
+    def post_click_plan(self, instruction="Open my profile", page=None):
+        return self.client.post(
+            "/click-plan",
+            json={
+                "instruction": instruction,
+                "page": page or self.page,
+            },
+        )
+
+    def prompt_context(self, create_mock):
+        content = create_mock.call_args.kwargs["messages"][1]["content"]
+        serialized_context = content.split("Untrusted webpage information:\n", 1)[1]
+        return json.loads(serialized_context)
+
+    def test_selects_an_observed_navigation_link(self):
+        proposal = {
+            "target_id": target_id(100),
+            "ambiguous": False,
+            "action_description": "Open the Profile link.",
+            "expected_outcome": "The profile page opens.",
+            "rejection_reason": None,
+        }
+        with patch.object(
+            main.client.chat.completions,
+            "create",
+            return_value=groq_response(json.dumps(proposal)),
+        ) as create:
+            response = self.post_click_plan()
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json(),
+            {
+                "valid": True,
+                "target_id": target_id(100),
+                "element_type": "a",
+                "element_text": "Profile",
+                "action_description": "Open the Profile link.",
+                "expected_outcome": "The profile page opens.",
+                "rejection_reason": None,
+            },
+        )
+        prompt = create.call_args.kwargs["messages"][1]["content"]
+        self.assertIn(target_id(100), prompt)
+        self.assertNotIn('"index"', prompt)
+
+    def test_selects_an_observed_safe_button(self):
+        proposal = {
+            "target_id": target_id(101),
+            "ambiguous": False,
+            "action_description": "Expand the preferences section.",
+            "expected_outcome": "Preference options become visible.",
+            "rejection_reason": None,
+        }
+        with patch.object(
+            main.client.chat.completions,
+            "create",
+            return_value=groq_response(json.dumps(proposal)),
+        ):
+            response = self.post_click_plan(instruction="Expand preferences")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["valid"])
+        self.assertEqual(response.json()["target_id"], target_id(101))
+        self.assertEqual(response.json()["element_type"], "button")
+
+    def test_navigation_link_ranks_above_same_named_video_link_without_hiding_it(self):
+        navigation_target = target_id(108)
+        video_target = target_id(109)
+        page = {
+            **self.page,
+            "interactive_elements": [
+                {
+                    "index": 0,
+                    "target_id": navigation_target,
+                    "type": "a",
+                    "element_tag": "a",
+                    "accessible_role": "link",
+                    "label": "Shorts",
+                    "accessible_name": "Shorts",
+                    "href": "https://example.test/shorts/",
+                    "landmark_label": "Primary navigation",
+                    "ancestor_context": [
+                        "navigation: Primary navigation",
+                        "aside: Sidebar",
+                    ],
+                    "visible": True,
+                    "disabled": False,
+                },
+                {
+                    "index": 1,
+                    "target_id": video_target,
+                    "type": "a",
+                    "element_tag": "a",
+                    "accessible_role": "link",
+                    "label": "Shorts",
+                    "accessible_name": "Shorts",
+                    "href": "https://example.test/watch?v=clip",
+                    "landmark_label": "Main content",
+                    "ancestor_context": [
+                        "main: Watch feed",
+                        "article: Shorts video",
+                    ],
+                    "visible": True,
+                    "disabled": False,
+                },
+                *[
+                    {
+                        "index": index,
+                        "target_id": target_id(300 + index),
+                        "type": "a",
+                        "label": f"Unrelated video {index}",
+                        "href": f"https://example.test/watch?v={index}",
+                        "visible": True,
+                        "disabled": False,
+                    }
+                    for index in range(2, 32)
+                ],
+            ],
+        }
+        proposal = {
+            "target_id": navigation_target,
+            "ambiguous": False,
+            "action_description": "Open the Shorts navigation item.",
+            "expected_outcome": "The Shorts page opens.",
+            "rejection_reason": None,
+        }
+
+        with patch.object(
+            main.client.chat.completions,
+            "create",
+            return_value=groq_response(json.dumps(proposal)),
+        ) as create:
+            response = self.post_click_plan(
+                instruction="Click Shorts in the left sidebar navigation, below Home.",
+                page=page,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["valid"])
+        context = self.prompt_context(create)
+        self.assertEqual(context["eligible_candidate_count"], 32)
+        self.assertLess(context["candidates_sent"], context["eligible_candidate_count"])
+        candidates = context["eligible_elements"]
+        self.assertEqual(candidates[0]["target_id"], navigation_target)
+        self.assertEqual(candidates[0]["context_category"], "sidebar_navigation")
+        self.assertEqual(candidates[0]["accessible_name"], "Shorts")
+        self.assertEqual(candidates[0]["accessible_role"], "link")
+        self.assertEqual(candidates[0]["landmark_label"], "Primary navigation")
+        self.assertEqual(candidates[1]["target_id"], video_target)
+        self.assertEqual(candidates[1]["context_category"], "video_content")
+
+    def test_sidebar_navigation_is_distinguished_from_page_content(self):
+        page = {
+            **self.page,
+            "interactive_elements": [
+                {
+                    "index": 0,
+                    "target_id": target_id(110),
+                    "type": "a",
+                    "accessible_role": "link",
+                    "element_tag": "a",
+                    "label": "Library",
+                    "accessible_name": "Library",
+                    "href": "https://example.test/library",
+                    "landmark_label": "Main navigation",
+                    "ancestor_context": ["navigation: Main navigation", "aside: Sidebar"],
+                    "visible": True,
+                    "disabled": False,
+                },
+                {
+                    "index": 1,
+                    "target_id": target_id(111),
+                    "type": "a",
+                    "accessible_role": "link",
+                    "element_tag": "a",
+                    "label": "Library",
+                    "accessible_name": "Library",
+                    "href": "https://example.test/articles/library",
+                    "landmark_label": "Main content",
+                    "ancestor_context": ["main: Main content", "article: Library"],
+                    "visible": True,
+                    "disabled": False,
+                },
+            ],
+        }
+        candidates = main.build_click_candidates(main.PageObservation.model_validate(page))
+        ranked = main.rank_click_candidates("Open Library in the sidebar navigation", candidates)
+
+        self.assertEqual(ranked[0]["target_id"], target_id(110))
+        self.assertEqual(ranked[0]["context_category"], "sidebar_navigation")
+        self.assertEqual(ranked[1]["target_id"], target_id(111))
+        self.assertEqual(ranked[1]["context_category"], "page_content")
+
+    def test_equally_matching_links_remain_in_prompt_and_ambiguous_plan_is_rejected(self):
+        page = {
+            **self.page,
+            "interactive_elements": [
+                {
+                    "index": index,
+                    "target_id": target_id(112 + index),
+                    "type": "a",
+                    "element_tag": "a",
+                    "accessible_role": "link",
+                    "label": "Settings",
+                    "accessible_name": "Settings",
+                    "href": f"https://example.test/settings/{index}",
+                    "landmark_label": "Account navigation",
+                    "ancestor_context": ["navigation: Account navigation", "aside: Sidebar"],
+                    "visible": True,
+                    "disabled": False,
+                }
+                for index in range(2)
+            ],
+        }
+        proposal = {
+            "target_id": None,
+            "ambiguous": True,
+            "action_description": None,
+            "expected_outcome": None,
+            "rejection_reason": "Two Settings links match in the sidebar.",
+        }
+
+        with patch.object(
+            main.client.chat.completions,
+            "create",
+            return_value=groq_response(json.dumps(proposal)),
+        ) as create:
+            response = self.post_click_plan(
+                instruction="Open Settings in the sidebar navigation",
+                page=page,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()["valid"])
+        self.assertIn("Two Settings links", response.json()["rejection_reason"])
+        candidates = self.prompt_context(create)["eligible_elements"]
+        self.assertEqual({candidate["target_id"] for candidate in candidates}, {
+            target_id(112), target_id(113)
+        })
+
+    def test_legacy_observation_without_semantic_context_still_uses_safe_fallbacks(self):
+        proposal = {
+            "target_id": target_id(100),
+            "ambiguous": False,
+            "action_description": "Open Profile.",
+            "expected_outcome": "The profile page opens.",
+            "rejection_reason": None,
+        }
+        with patch.object(
+            main.client.chat.completions,
+            "create",
+            return_value=groq_response(json.dumps(proposal)),
+        ) as create:
+            response = self.post_click_plan()
+
+        self.assertTrue(response.json()["valid"])
+        profile = next(
+            candidate for candidate in self.prompt_context(create)["eligible_elements"]
+            if candidate["target_id"] == target_id(100)
+        )
+        self.assertEqual(profile["accessible_name"], "Profile")
+        self.assertEqual(profile["accessible_role"], "link")
+        self.assertEqual(profile["element_type"], "a")
+        self.assertIsNone(profile["landmark_label"])
+        self.assertEqual(profile["ancestor_context"], [])
+
+    def test_malformed_target_id_is_rejected(self):
+        proposal = {
+            "target_id": "css-selector-for-profile",
+            "ambiguous": False,
+            "action_description": "Open a page.",
+            "expected_outcome": "A page opens.",
+            "rejection_reason": None,
+        }
+        with patch.object(
+            main.client.chat.completions,
+            "create",
+            return_value=groq_response(json.dumps(proposal)),
+        ):
+            response = self.post_click_plan()
+
+        self.assertFalse(response.json()["valid"])
+        self.assertIn("not present", response.json()["rejection_reason"])
+
+    def test_rejects_an_invalid_target_id(self):
+        proposal = {
+            "target_id": target_id(199),
+            "ambiguous": False,
+            "action_description": "Open a page.",
+            "expected_outcome": "A page opens.",
+            "rejection_reason": None,
+        }
+        with patch.object(
+            main.client.chat.completions,
+            "create",
+            return_value=groq_response(json.dumps(proposal)),
+        ):
+            response = self.post_click_plan()
+
+        self.assertFalse(response.json()["valid"])
+        self.assertIsNone(response.json()["target_id"])
+        self.assertIn("not present", response.json()["rejection_reason"])
+
+    def test_rejects_hidden_targets(self):
+        hidden_page = dict(self.page)
+        hidden_page["interactive_elements"] = [
+            *self.page["interactive_elements"],
+            {
+                "index": 2,
+                "target_id": target_id(102),
+                "type": "button",
+                "label": "Hidden control",
+                "visible": False,
+                "disabled": False,
+            },
+        ]
+        proposal = {
+            "target_id": target_id(102),
+            "ambiguous": False,
+            "action_description": "Open the control.",
+            "expected_outcome": "The control opens.",
+        }
+        with patch.object(
+            main.client.chat.completions,
+            "create",
+            return_value=groq_response(json.dumps(proposal)),
+        ):
+            response = self.post_click_plan(page=hidden_page)
+
+        self.assertFalse(response.json()["valid"])
+        self.assertIn("hidden", response.json()["rejection_reason"])
+
+    def test_rejects_disabled_targets(self):
+        disabled_page = dict(self.page)
+        disabled_page["interactive_elements"] = [
+            *self.page["interactive_elements"],
+            {
+                "index": 2,
+                "target_id": target_id(103),
+                "type": "button",
+                "label": "Disabled control",
+                "visible": True,
+                "disabled": True,
+            },
+        ]
+        proposal = {
+            "target_id": target_id(103),
+            "ambiguous": False,
+            "action_description": "Open the control.",
+            "expected_outcome": "The control opens.",
+        }
+        with patch.object(
+            main.client.chat.completions,
+            "create",
+            return_value=groq_response(json.dumps(proposal)),
+        ):
+            response = self.post_click_plan(page=disabled_page)
+
+        self.assertFalse(response.json()["valid"])
+        self.assertIn("disabled", response.json()["rejection_reason"])
+
+    def test_requires_observed_enabled_state_before_planning(self):
+        incomplete_page = {
+            **self.page,
+            "interactive_elements": [
+                {
+                    "index": 0,
+                    "target_id": target_id(106),
+                    "type": "button",
+                    "label": "Open settings",
+                    "visible": True,
+                }
+            ],
+        }
+        with patch.object(main.client.chat.completions, "create") as create:
+            response = self.client.post(
+                "/click-plan",
+                json={
+                    "instruction": "Open settings",
+                    "page": incomplete_page,
+                },
+            )
+
+        self.assertFalse(response.json()["valid"])
+        self.assertIn("enabled state was not observed", response.json()["rejection_reason"])
+        create.assert_not_called()
+
+    def test_requires_observed_visibility_before_planning(self):
+        incomplete_page = {
+            **self.page,
+            "interactive_elements": [
+                {
+                    "index": 0,
+                    "target_id": target_id(107),
+                    "type": "button",
+                    "label": "Open settings",
+                    "disabled": False,
+                }
+            ],
+        }
+        with patch.object(main.client.chat.completions, "create") as create:
+            response = self.client.post(
+                "/click-plan",
+                json={
+                    "instruction": "Open settings",
+                    "page": incomplete_page,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()["valid"])
+        self.assertIn("visibility was not observed", response.json()["rejection_reason"])
+        create.assert_not_called()
+
+    def test_rejects_destructive_button(self):
+        destructive_page = dict(self.page)
+        destructive_page["interactive_elements"] = [
+            *self.page["interactive_elements"],
+            {
+                "index": 2,
+                "target_id": target_id(104),
+                "type": "button",
+                "label": "Delete account",
+                "visible": True,
+                "disabled": False,
+            },
+        ]
+        proposal = {
+            "target_id": target_id(104),
+            "ambiguous": False,
+            "action_description": "Delete the account.",
+            "expected_outcome": "The account is deleted.",
+        }
+        with patch.object(
+            main.client.chat.completions,
+            "create",
+            return_value=groq_response(json.dumps(proposal)),
+        ):
+            response = self.post_click_plan(page=destructive_page)
+
+        self.assertFalse(response.json()["valid"])
+        self.assertIn("destructive", response.json()["rejection_reason"])
+
+    def test_rejects_purchase_or_payment_instruction_without_calling_groq(self):
+        with patch.object(main.client.chat.completions, "create") as create:
+            response = self.post_click_plan(
+                instruction="Click the purchase button to buy this item",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["valid"])
+        self.assertIn("purchase", response.json()["rejection_reason"])
+        create.assert_not_called()
+
+    def test_rejects_ambiguous_instruction_without_selecting_a_target(self):
+        proposal = {
+            "target_id": None,
+            "ambiguous": True,
+            "action_description": None,
+            "expected_outcome": None,
+            "rejection_reason": "There are multiple matching settings sections.",
+        }
+        with patch.object(
+            main.client.chat.completions,
+            "create",
+            return_value=groq_response(json.dumps(proposal)),
+        ):
+            response = self.post_click_plan(
+                instruction="Open settings",
+            )
+
+        self.assertFalse(response.json()["valid"])
+        self.assertIsNone(response.json()["target_id"])
+        self.assertIn("multiple matching", response.json()["rejection_reason"])
+
+    def test_rejects_a_missing_target(self):
+        proposal = {
+            "target_id": None,
+            "ambiguous": False,
+            "action_description": None,
+            "expected_outcome": None,
+            "rejection_reason": "No matching link was observed.",
+        }
+        with patch.object(
+            main.client.chat.completions,
+            "create",
+            return_value=groq_response(json.dumps(proposal)),
+        ):
+            response = self.post_click_plan(
+                instruction="Open the billing page",
+            )
+
+        self.assertFalse(response.json()["valid"])
+        self.assertIsNone(response.json()["target_id"])
+        self.assertIn("No matching link", response.json()["rejection_reason"])
+
+    def test_rejects_form_submission_control(self):
+        submit_page = dict(self.page)
+        submit_page["interactive_elements"] = [
+            *self.page["interactive_elements"],
+            {
+                "index": 2,
+                "target_id": target_id(105),
+                "type": "button",
+                "label": "Continue",
+                "visible": True,
+                "disabled": False,
+                "submit_button": True,
+            },
+        ]
+        proposal = {
+            "target_id": target_id(105),
+            "ambiguous": False,
+            "action_description": "Continue.",
+            "expected_outcome": "The form is submitted.",
+        }
+        with patch.object(
+            main.client.chat.completions,
+            "create",
+            return_value=groq_response(json.dumps(proposal)),
+        ):
+            response = self.post_click_plan(page=submit_page)
+
+        self.assertFalse(response.json()["valid"])
+        self.assertIn("Form submission", response.json()["rejection_reason"])
+
+
 if __name__ == "__main__":
     unittest.main()

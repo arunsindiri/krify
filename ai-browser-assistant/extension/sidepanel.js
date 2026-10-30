@@ -11,6 +11,17 @@ const interactiveElementsDisplay = document.getElementById("interactiveElements"
 const pageQuestionInput = document.getElementById("pageQuestion");
 const askPageButton = document.getElementById("askPage");
 const pageAnswerDisplay = document.getElementById("pageAnswer");
+const clickInstructionInput = document.getElementById("clickInstruction");
+const planClickButton = document.getElementById("planClick");
+const clickResultDisplay = document.getElementById("clickResult");
+const clickConfirmation = document.getElementById("clickConfirmation");
+const clickConfirmationWebsite = document.getElementById("clickConfirmationWebsite");
+const clickConfirmationAction = document.getElementById("clickConfirmationAction");
+const clickConfirmationTarget = document.getElementById("clickConfirmationTarget");
+const clickConfirmationType = document.getElementById("clickConfirmationType");
+const clickConfirmationOutcome = document.getElementById("clickConfirmationOutcome");
+const confirmClickButton = document.getElementById("confirmClick");
+const cancelClickButton = document.getElementById("cancelClick");
 const searchQueryInput = document.getElementById("searchQuery");
 const searchPageButton = document.getElementById("searchPage");
 const searchResultDisplay = document.getElementById("searchResult");
@@ -21,16 +32,28 @@ const searchConfirmationInput = document.getElementById("searchConfirmationInput
 const searchConfirmationSubmit = document.getElementById("searchConfirmationSubmit");
 const confirmSearchButton = document.getElementById("confirmSearch");
 const cancelSearchButton = document.getElementById("cancelSearch");
+const CLICK_TARGET_ID_PATTERN = /^target-[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const CLICK_APPROVAL_MAX_AGE_MS = 4 * 60 * 1000;
 let currentObservation = null;
+let currentObservationAt = null;
+let clickObservationInvalidated = false;
 let activeTabContext = null;
 let activeTabContextUpdate = 0;
 let pendingSearchConfirmation = null;
 let searchOperationInProgress = false;
+let pendingClickConfirmation = null;
+let approvedClickApproval = null;
+let clickPlanningInProgress = false;
+let clickConfirmationInProgress = false;
+let clickPlanningTabId = null;
+let clickPlanRequestVersion = 0;
 
 chrome.tabs.onActivated.addListener((activeInfo) => {
     if (pendingSearchConfirmation?.tabId !== activeInfo.tabId) {
         discardPendingSearchConfirmation("The active tab changed.");
     }
+    clickObservationInvalidated = true;
+    invalidateClickState("The active tab changed.");
     void refreshActiveTabContext();
 });
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
@@ -39,6 +62,12 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
         (changeInfo.url || changeInfo.status === "complete")
     ) {
         discardPendingSearchConfirmation("The webpage changed.");
+    }
+    if (changeInfo.url || changeInfo.status === "loading" || changeInfo.status === "complete") {
+        if (hasClickStateForTab(tabId) || tabId === activeTabContext?.tabId) {
+            clickObservationInvalidated = true;
+            invalidateClickState("The webpage changed.");
+        }
     }
     if (changeInfo.url || changeInfo.status === "complete") {
         void refreshActiveTabContext();
@@ -88,7 +117,14 @@ async function handlePageObservationLifecycleMessage(message) {
             return;
         }
 
+        invalidateClickState(
+            message.type === "PAGE_OBSERVATION_FAILED"
+                ? "The page observation is no longer available."
+                : "The webpage changed."
+        );
+        clickObservationInvalidated = true;
         currentObservation = null;
+        currentObservationAt = null;
         observationDisplay.hidden = true;
         if (pendingSearchConfirmation) {
             discardPendingSearchConfirmation("The webpage navigated.");
@@ -387,6 +423,370 @@ askPageButton.addEventListener("click", async () => {
     }
 });
 
+    planClickButton.addEventListener("click", planClick);
+    confirmClickButton.addEventListener("click", confirmClickPlan);
+    cancelClickButton.addEventListener("click", () => {
+        if (clickPlanningInProgress || clickConfirmationInProgress || !pendingClickConfirmation) {
+            return;
+        }
+
+        pendingClickConfirmation = null;
+        clickConfirmation.hidden = true;
+        clickResultDisplay.textContent = "Click plan cancelled.";
+        clickResultDisplay.hidden = false;
+        updateClickControls();
+    });
+
+    async function planClick() {
+        if (clickPlanningInProgress || clickConfirmationInProgress || pendingClickConfirmation) {
+            return;
+        }
+
+        const instruction = clickInstructionInput.value.trim();
+        if (!instruction) {
+            clickResultDisplay.textContent = "Enter an instruction for the page action.";
+            clickResultDisplay.hidden = false;
+            return;
+        }
+
+        const observation = currentObservation;
+        const tabContext = activeTabContext;
+        if (clickObservationInvalidated) {
+            clickResultDisplay.textContent = "The page changed. Observe it again before planning an action.";
+            clickResultDisplay.hidden = false;
+            return;
+        }
+        if (!observation) {
+            clickResultDisplay.textContent = "Observe a webpage before planning a page action.";
+            clickResultDisplay.hidden = false;
+            return;
+        }
+        if (
+            !tabContext ||
+            !Number.isInteger(tabContext.tabId) ||
+            tabContext.pageUrl?.href !== observation.url
+        ) {
+            clickResultDisplay.textContent = "The active page changed. Observe it again before planning an action.";
+            clickResultDisplay.hidden = false;
+            return;
+        }
+
+        const expiresAt = currentObservationAt + CLICK_APPROVAL_MAX_AGE_MS;
+        if (!Number.isFinite(currentObservationAt) || Date.now() >= expiresAt) {
+            clickResultDisplay.textContent = "This observation has expired. Observe the page again before planning an action.";
+            clickResultDisplay.hidden = false;
+            return;
+        }
+
+        const requestVersion = ++clickPlanRequestVersion;
+        clickPlanningInProgress = true;
+        clickPlanningTabId = tabContext.tabId;
+        approvedClickApproval = null;
+        clickResultDisplay.textContent = "Planning the page action...";
+        clickResultDisplay.hidden = false;
+        updateClickControls();
+
+        try {
+            const response = await fetch("http://127.0.0.1:8000/click-plan", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    instruction,
+                    page: buildPagePayload(observation)
+                })
+            });
+            const plan = await response.json();
+            if (!response.ok) {
+                throw new Error(plan.detail || `Server returned status ${response.status}`);
+            }
+            if (requestVersion !== clickPlanRequestVersion) {
+                return;
+            }
+            if (
+                currentObservation !== observation ||
+                clickObservationInvalidated ||
+                activeTabContext?.tabId !== tabContext.tabId ||
+                activeTabContext.pageUrl?.href !== observation.url ||
+                Date.now() >= expiresAt
+            ) {
+                throw new Error("The page or observation changed. Observe it again and retry.");
+            }
+
+            const validation = validateClickPlanResponse(plan, observation);
+            if (!validation.target) {
+                clickResultDisplay.textContent = validation.reason;
+                return;
+            }
+
+            pendingClickConfirmation = {
+                plan,
+                target: validation.target,
+                observation,
+                tabId: tabContext.tabId,
+                expectedUrl: observation.url,
+                expiresAt
+            };
+            displayClickConfirmation(pendingClickConfirmation);
+            clickResultDisplay.textContent = "Review the action details before confirming.";
+        } catch (error) {
+            if (requestVersion === clickPlanRequestVersion) {
+                clickResultDisplay.textContent = `Unable to plan the page action: ${error.message}`;
+            }
+        } finally {
+            if (requestVersion === clickPlanRequestVersion) {
+                clickPlanningInProgress = false;
+                clickPlanningTabId = null;
+                updateClickControls();
+            }
+        }
+    }
+
+    function validateClickPlanResponse(plan, observation) {
+        if (!plan || plan.valid !== true) {
+            return {
+                target: null,
+                reason: typeof plan?.rejection_reason === "string" && plan.rejection_reason.trim()
+                    ? plan.rejection_reason.slice(0, 300)
+                    : "The backend did not approve this page action plan."
+            };
+        }
+
+        if (typeof plan.target_id !== "string" || !CLICK_TARGET_ID_PATTERN.test(plan.target_id)) {
+            return { target: null, reason: "The click plan contains an invalid target ID." };
+        }
+
+        const matches = observation.interactiveElements.filter(
+            element => element.target_id === plan.target_id
+        );
+        if (matches.length !== 1) {
+            return { target: null, reason: "The click plan target is not in the current page observation." };
+        }
+
+        const target = matches[0];
+        const supportedTypes = new Set(["a", "link", "button", "tab", "input (button)"]);
+        if (
+            target.visible !== true ||
+            target.disabled !== false ||
+            target.submit_button ||
+            !supportedTypes.has(target.type)
+        ) {
+            return { target: null, reason: "The selected element is not an eligible observed page target." };
+        }
+
+        const hasAnchorDestination = target.element_tag === "a" && Boolean(target.href);
+        if (target.type === "a" || target.type === "link" || hasAnchorDestination) {
+            try {
+                const destination = new URL(target.href, observation.url);
+                if (
+                    !["http:", "https:"].includes(destination.protocol) ||
+                    destination.username ||
+                    destination.password
+                ) {
+                    return { target: null, reason: "The selected link has an unsupported destination." };
+                }
+            } catch {
+                return { target: null, reason: "The selected link has no valid destination." };
+            }
+        }
+
+        if (
+            plan.element_type !== target.type ||
+            plan.element_text !== target.label ||
+            typeof plan.action_description !== "string" ||
+            !plan.action_description.trim() ||
+            plan.action_description.length > 300 ||
+            typeof plan.expected_outcome !== "string" ||
+            !plan.expected_outcome.trim() ||
+            plan.expected_outcome.length > 300
+        ) {
+            return { target: null, reason: "The click plan details do not match the observed target." };
+        }
+
+        return { target, reason: null };
+    }
+
+    function displayClickConfirmation(pending) {
+        let website = pending.expectedUrl;
+        try {
+            website = new URL(pending.expectedUrl).hostname || pending.expectedUrl;
+        } catch {
+            // Keep the observed URL as the display fallback.
+        }
+
+        clickConfirmationWebsite.textContent = website;
+        clickConfirmationAction.textContent = pending.plan.action_description;
+        clickConfirmationTarget.textContent = pending.target.label || "(no label)";
+        clickConfirmationType.textContent = pending.target.type;
+        clickConfirmationOutcome.textContent = pending.plan.expected_outcome;
+        clickConfirmation.hidden = false;
+        updateClickControls();
+    }
+
+    async function confirmClickPlan() {
+        if (clickPlanningInProgress || clickConfirmationInProgress || !pendingClickConfirmation) {
+            return;
+        }
+
+        const pending = pendingClickConfirmation;
+        clickConfirmationInProgress = true;
+        updateClickControls();
+        let approvalConsumed = false;
+
+        try {
+            if (Date.now() >= pending.expiresAt) {
+                throw new Error("This click plan has expired. Observe the page and create a new plan.");
+            }
+            if (
+                pendingClickConfirmation !== pending ||
+                clickObservationInvalidated ||
+                currentObservation !== pending.observation ||
+                currentObservation.url !== pending.expectedUrl ||
+                activeTabContext?.tabId !== pending.tabId ||
+                activeTabContext.pageUrl?.href !== pending.expectedUrl
+            ) {
+                throw new Error("The page or target changed. Observe the page and create a new plan.");
+            }
+
+            const validation = validateClickPlanResponse(pending.plan, pending.observation);
+            if (validation.target !== pending.target) {
+                throw new Error(validation.reason || "The click target is no longer valid.");
+            }
+
+            const [activeTab] = await chrome.tabs.query({
+                active: true,
+                lastFocusedWindow: true
+            });
+            if (
+                pendingClickConfirmation !== pending ||
+                Date.now() >= pending.expiresAt ||
+                activeTab?.id !== pending.tabId ||
+                activeTab.url !== pending.expectedUrl
+            ) {
+                throw new Error("The active page changed or the plan expired. Create a new plan.");
+            }
+
+            approvedClickApproval = {
+                targetId: pending.plan.target_id,
+                elementType: pending.target.type,
+                elementText: pending.target.label,
+                expectedHref: pending.target.href ?? null,
+                actionDescription: pending.plan.action_description,
+                expectedOutcome: pending.plan.expected_outcome,
+                observation: pending.observation,
+                tabId: pending.tabId,
+                expectedUrl: pending.expectedUrl,
+                approvedAt: Date.now(),
+                expiresAt: pending.expiresAt,
+                consumed: false
+            };
+
+            const approval = consumeClickApproval();
+            if (!approval) {
+                throw new Error("The click approval expired or became stale before execution.");
+            }
+            approvalConsumed = true;
+            pendingClickConfirmation = null;
+            clickConfirmation.hidden = true;
+            clickResultDisplay.textContent = "Executing approved click...";
+            clickResultDisplay.hidden = false;
+
+            let execution;
+            try {
+                execution = await chrome.runtime.sendMessage({
+                    type: "EXECUTE_APPROVED_CLICK",
+                    tabId: approval.tabId,
+                    expectedUrl: approval.expectedUrl,
+                    targetId: approval.targetId,
+                    expectedElementType: approval.elementType,
+                    expectedElementText: approval.elementText,
+                    expectedHref: approval.expectedHref,
+                    approvalExpiresAt: approval.expiresAt
+                });
+            } catch (error) {
+                clickResultDisplay.textContent =
+                    `Click failed: the execution request did not complete. Do not retry automatically. ${error.message}`;
+                return;
+            }
+
+            if (!execution?.ok) {
+                const state = execution?.status === "rejected" ? "Click rejected" : "Click failed";
+                clickResultDisplay.textContent = `${state}: ${execution?.error || "The click was not dispatched."}`;
+                return;
+            }
+            if (execution.result?.status !== "dispatched") {
+                clickResultDisplay.textContent =
+                    "Click failed: the executor returned an invalid result. Do not retry automatically.";
+                return;
+            }
+
+            clickResultDisplay.textContent = `Click dispatched: ${execution.result.message || "The page outcome was not verified."}`;
+        } catch (error) {
+            if (pendingClickConfirmation === pending) {
+                pendingClickConfirmation = null;
+                clickConfirmation.hidden = true;
+            }
+            clickResultDisplay.textContent = approvalConsumed
+                ? `Click failed: ${error.message}`
+                : `Unable to approve the page action: ${error.message}`;
+            clickResultDisplay.hidden = false;
+        } finally {
+            clickConfirmationInProgress = false;
+            updateClickControls();
+        }
+    }
+
+    function consumeClickApproval() {
+        const approval = approvedClickApproval;
+        if (
+            !approval ||
+            approval.consumed ||
+            Date.now() >= approval.expiresAt ||
+            clickObservationInvalidated ||
+            currentObservation !== approval.observation ||
+            activeTabContext?.tabId !== approval.tabId ||
+            activeTabContext.pageUrl?.href !== approval.expectedUrl
+        ) {
+            approvedClickApproval = null;
+            return null;
+        }
+
+        approvedClickApproval = null;
+        return { ...approval, consumed: true };
+    }
+
+    function hasClickStateForTab(tabId) {
+        return pendingClickConfirmation?.tabId === tabId ||
+            approvedClickApproval?.tabId === tabId ||
+            (clickPlanningInProgress && clickPlanningTabId === tabId);
+    }
+
+    function invalidateClickState(reason) {
+        const hadClickState = Boolean(
+            pendingClickConfirmation || approvedClickApproval || clickPlanningInProgress
+        );
+        clickPlanRequestVersion += 1;
+        pendingClickConfirmation = null;
+        approvedClickApproval = null;
+        clickPlanningInProgress = false;
+        clickPlanningTabId = null;
+        clickConfirmation.hidden = true;
+        if (hadClickState) {
+            clickResultDisplay.textContent = `Click approval invalidated: ${reason}`;
+            clickResultDisplay.hidden = false;
+        }
+        updateClickControls();
+    }
+
+    function updateClickControls() {
+        planClickButton.disabled = clickPlanningInProgress ||
+            clickConfirmationInProgress ||
+            Boolean(pendingClickConfirmation);
+        confirmClickButton.disabled = clickConfirmationInProgress || !pendingClickConfirmation;
+        cancelClickButton.disabled = clickConfirmationInProgress || !pendingClickConfirmation;
+    }
+
 searchPageButton.addEventListener("click", async () => {
     if (searchOperationInProgress || pendingSearchConfirmation) {
         return;
@@ -607,7 +1007,12 @@ function displayObservation(observation) {
     if (pendingSearchConfirmation && pendingSearchConfirmation.observation !== observation) {
         discardPendingSearchConfirmation("A new page observation replaced the search target.");
     }
+    if (currentObservation !== observation) {
+        invalidateClickState("A new page observation replaced the target.");
+    }
     currentObservation = observation;
+    currentObservationAt = Date.now();
+    clickObservationInvalidated = false;
     pageTitleDisplay.textContent = observation.title || "Untitled page";
     pageUrlDisplay.textContent = observation.url;
     pageTextDisplay.textContent = observation.visibleText || "No visible text found.";
@@ -661,6 +1066,15 @@ function buildPagePayload(observation, { includeSearchEvidence = false } = {}) {
                 label: element.label.slice(0, 200),
                 index: element.index,
                 target_id: element.target_id ?? null,
+                element_tag: element.element_tag?.slice(0, 40) ?? null,
+                accessible_role: element.accessible_role?.slice(0, 40) ?? null,
+                accessible_name: element.accessible_name?.slice(0, 200) ?? null,
+                landmark_label: element.landmark_label?.slice(0, 200) ?? null,
+                ancestor_context: Array.isArray(element.ancestor_context)
+                    ? element.ancestor_context.slice(0, 4).map(context => context.slice(0, 180))
+                    : [],
+                visible: typeof element.visible === "boolean" ? element.visible : null,
+                disabled: typeof element.disabled === "boolean" ? element.disabled : null,
                 search_candidate: Boolean(element.search_candidate),
                 searchable: Boolean(element.searchable),
                 search_rejection_reason: element.search_rejection_reason?.slice(0, 200) ?? null,

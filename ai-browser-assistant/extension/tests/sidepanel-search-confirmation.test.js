@@ -31,9 +31,16 @@ function createObservation(url = "https://www.udemy.com/courses/search/") {
                 index: 0,
                 target_id: "target-00000000-0000-4000-8000-000000000001",
                 type: "input (text)",
+                element_tag: "input",
+                accessible_role: "searchbox",
+                accessible_name: "Search for anything",
+                landmark_label: "Search",
+                ancestor_context: ["form: Course search"],
                 label: "",
                 placeholder: "Search for anything",
                 name: "q",
+                visible: true,
+                disabled: false,
                 searchable: true,
                 search_candidate: true,
                 form_index: 0,
@@ -43,7 +50,12 @@ function createObservation(url = "https://www.udemy.com/courses/search/") {
                 index: 1,
                 target_id: "target-00000000-0000-4000-8000-000000000002",
                 type: "button",
+                element_tag: "button",
+                accessible_role: "button",
+                accessible_name: "Submit search",
                 label: "Submit search",
+                visible: true,
+                disabled: false,
                 searchable: false,
                 form_index: 0,
                 submit_button: true
@@ -158,6 +170,9 @@ function loadSearchPanel({
         calls,
         elements,
         observation,
+        buildPagePayload(payload = observation) {
+            return context.buildPagePayload(payload);
+        },
         ready: vm.runInContext("refreshActiveTabContext()", context),
         showObservation() {
             context.displayObservation(observation);
@@ -177,6 +192,35 @@ function loadSearchPanel({
         }
     };
 }
+
+test("page payload forwards explicit observation state and preserves unknown as null", () => {
+    const panel = loadSearchPanel();
+    const payload = panel.buildPagePayload();
+
+    assert.equal(payload.interactive_elements[0].visible, true);
+    assert.equal(payload.interactive_elements[0].disabled, false);
+    assert.equal(payload.interactive_elements[0].element_tag, "input");
+    assert.equal(payload.interactive_elements[0].accessible_role, "searchbox");
+    assert.equal(payload.interactive_elements[0].accessible_name, "Search for anything");
+    assert.equal(payload.interactive_elements[0].landmark_label, "Search");
+    assert.deepEqual(
+        JSON.parse(JSON.stringify(payload.interactive_elements[0].ancestor_context)),
+        ["form: Course search"]
+    );
+    assert.equal(payload.interactive_elements[1].visible, true);
+    assert.equal(payload.interactive_elements[1].disabled, false);
+
+    const unknownStatePayload = panel.buildPagePayload({
+        ...panel.observation,
+        interactiveElements: [{
+            ...panel.observation.interactiveElements[0],
+            visible: undefined,
+            disabled: undefined
+        }]
+    });
+    assert.equal(unknownStatePayload.interactive_elements[0].visible, null);
+    assert.equal(unknownStatePayload.interactive_elements[0].disabled, null);
+});
 
 test("shows the selected search and executes it after confirmation", async () => {
     const panel = loadSearchPanel();

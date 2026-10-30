@@ -150,12 +150,21 @@
             background: #fff;
         }
 
-        #searchConfirmation p {
+        #clickConfirmation {
+            padding: 12px;
+            border: 1px solid #c8cfdb;
+            border-radius: 8px;
+            background: #fff;
+        }
+
+        #searchConfirmation p,
+        #clickConfirmation p {
             margin: 8px 0;
             overflow-wrap: anywhere;
         }
 
-        #searchConfirmation button:first-of-type {
+        #searchConfirmation button:first-of-type,
+        #clickConfirmation button:first-of-type {
             margin-top: 16px;
         }
 
@@ -200,6 +209,21 @@
                 <textarea id="pageQuestion" maxlength="1000" placeholder="Ask a question about the webpage"></textarea>
                 <button id="askPage" type="button">Ask about page</button>
                 <p id="pageAnswer" role="status" aria-live="polite" hidden></p>
+
+                <label for="clickInstruction">Click instruction</label>
+                <textarea id="clickInstruction" maxlength="1000" placeholder="For example, open the Profile link"></textarea>
+                <button id="planClick" type="button">Plan click</button>
+                <p id="clickResult" role="status" aria-live="polite" hidden></p>
+                <section id="clickConfirmation" aria-labelledby="clickConfirmationHeading" aria-live="polite" hidden>
+                    <h3 id="clickConfirmationHeading">Confirm page action</h3>
+                    <p>Website: <span id="clickConfirmationWebsite"></span></p>
+                    <p>Proposed action: <span id="clickConfirmationAction"></span></p>
+                    <p>Target element: <span id="clickConfirmationTarget"></span></p>
+                    <p>Element type: <span id="clickConfirmationType"></span></p>
+                    <p>Expected outcome: <span id="clickConfirmationOutcome"></span></p>
+                    <button id="confirmClick" type="button">Confirm Action</button>
+                    <button id="cancelClick" class="secondary" type="button">Cancel</button>
+                </section>
 
                 <label for="searchQuery">Search this page</label>
                 <input type="text" id="searchQuery" maxlength="300" placeholder="What would you like to search for?">

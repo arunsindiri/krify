@@ -9,7 +9,7 @@ The current working end-to-end example is opening a website from a natural-langu
 - `Open GitHub`
 - `Take me to Google`
 
-> **Current scope:** The project can open websites, observe the active page, answer questions about it, and perform a user-confirmed search through a detected search form. Other page interactions and multi-step automation are not implemented.
+> **Current scope:** The project can open websites, observe the active page, answer questions about it, perform a user-confirmed search through a detected search form, and ask the backend to plan a safe click against an observed target. Click execution and multi-step automation are not implemented.
 
 ## Current Architecture
 
@@ -275,6 +275,8 @@ If a real API key has ever been committed or shared publicly, revoke it and gene
 - Added target-ID validation tests for reordered controls, detached/hidden/disabled/modified targets, expiry, invalid IDs, form changes, and duplicate execution.
 - Added automatic observation refresh after tab navigation/reload, including stale-state invalidation, permission-gated reconnects, restricted-page handling, and Side Panel refresh/error updates without automatic AI or browser actions.
 - Added lifecycle tests for reloads, cross-origin navigation, missing permissions, reconnect failures, content-script reinjection, target invalidation, and Side Panel refresh state.
+- Added backend-only `POST /click-plan` planning for observed navigation links, enabled non-submit buttons, and tabs; the endpoint rejects absent, ambiguous, hidden, disabled, form-submit, and sensitive/destructive targets without executing page actions.
+- Added click-plan tests for links, buttons, invalid and missing targets, hidden/disabled controls, destructive and payment actions, ambiguity, and form submissions.
 - Added tests for matching results, explicit no-results, mismatched queries, and URL-only/uncertain observations.
 - Verified that the backend receives and returns the user's instruction.
 - Created a separate Groq connectivity test in `test_groq.py`.
@@ -285,7 +287,7 @@ If a real API key has ever been committed or shared publicly, revoke it and gene
 
 ## Known Limitations and Next Steps
 
-The project is an early working prototype. Search automation only supports visible, form-associated search inputs and same-origin GET forms. It does not click arbitrary page elements or execute AI-generated code.
+The project is an early working prototype. Search automation only supports visible, form-associated search inputs and same-origin GET forms. Click Automation currently produces backend plans only; it does not execute clicks. Its observation input must include an explicit `disabled: false` for each candidate, which the current extension observation does not yet provide, so integration requires an observation update before plans can be created from the Side Panel. No AI-generated code or selectors are executed.
 
 Potential next steps:
 1. Add stronger validation for AI-generated actions and URLs before opening them.
