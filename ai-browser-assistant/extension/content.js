@@ -699,8 +699,13 @@ function validateApprovedClickTarget(target, message) {
 function isFormSubmitControl(element) {
     const tagName = element.tagName.toLowerCase();
     const inputType = tagName === "input" ? (element.type || "").toLowerCase() : "";
-    return (tagName === "button" && (element.type || "submit").toLowerCase() === "submit") ||
-        (tagName === "input" && ["submit", "image"].includes(inputType));
+    return Boolean(
+        element.form &&
+        (
+            (tagName === "button" && (element.type || "submit").toLowerCase() === "submit") ||
+            (tagName === "input" && ["submit", "image"].includes(inputType))
+        )
+    );
 }
 
 function isUnsafeClickTarget(element) {

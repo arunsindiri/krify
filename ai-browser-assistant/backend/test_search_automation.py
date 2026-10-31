@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import httpx
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -485,6 +486,329 @@ class ClickAutomationPlanningTests(unittest.TestCase):
         self.assertTrue(response.json()["valid"])
         self.assertEqual(response.json()["target_id"], target_id(101))
         self.assertEqual(response.json()["element_type"], "button")
+        self.assertNotIn("action_policy", response.json())
+
+    def test_notifications_settings_tabs_and_expand_controls_are_supported(self):
+        controls = [
+            ("Notifications", "button"),
+            ("Settings", "button"),
+            ("Account tab", "tab"),
+            ("Expand preferences", "button"),
+        ]
+        for index, (label, element_type) in enumerate(controls):
+            with self.subTest(label=label):
+                selected_target_id = target_id(700 + index)
+                page = {
+                    **self.page,
+                    "interactive_elements": [
+                        {
+                            "index": 0,
+                            "target_id": selected_target_id,
+                            "type": element_type,
+                            "label": label,
+                            "visible": True,
+                            "disabled": False,
+                        }
+                    ],
+                }
+                proposal = {
+                    "target_id": selected_target_id,
+                    "ambiguous": False,
+                    "action_description": f"Open {label}.",
+                    "expected_outcome": f"{label} opens.",
+                }
+                with patch.object(
+                    main.client.chat.completions,
+                    "create",
+                    return_value=groq_response(json.dumps(proposal)),
+                ):
+                    response = self.post_click_plan(
+                        instruction=f"Click {label}",
+                        page=page,
+                    )
+
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertTrue(response.json()["valid"])
+                self.assertNotIn("action_policy", response.json())
+
+    def test_restricted_observed_metadata_is_rejected_before_groq(self):
+        restricted_page = {
+            **self.page,
+            "interactive_elements": [
+                {
+                    "index": 0,
+                    "target_id": target_id(730),
+                    "type": "button",
+                    "label": "Continue",
+                    "name": "delete_account",
+                    "visible": True,
+                    "disabled": False,
+                }
+            ],
+        }
+        with patch.object(main.client.chat.completions, "create") as create:
+            response = self.post_click_plan(
+                instruction="Click Continue",
+                page=restricted_page,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()["valid"])
+        self.assertNotIn("action_policy", response.json())
+        self.assertIn("destructive", response.json()["rejection_reason"])
+        create.assert_not_called()
+
+    def test_financial_transaction_instruction_is_restricted_before_groq(self):
+        for instruction in ("Transfer money to Alex", "Withdraw funds"):
+            with self.subTest(instruction=instruction):
+                with patch.object(main.client.chat.completions, "create") as create:
+                    response = self.post_click_plan(instruction=instruction)
+
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertFalse(response.json()["valid"])
+                self.assertNotIn("action_policy", response.json())
+                create.assert_not_called()
+
+    def test_large_observation_is_bounded_before_sending_to_groq(self):
+        page = {
+            **self.page,
+            "visible_text": "Visible page text " * 600,
+        }
+        proposal = {
+            "target_id": target_id(100),
+            "ambiguous": False,
+            "action_description": "Open the Profile link.",
+            "expected_outcome": "The profile page opens.",
+        }
+        with patch.object(
+            main.client.chat.completions,
+            "create",
+            return_value=groq_response(json.dumps(proposal)),
+        ) as create:
+            response = self.post_click_plan(page=page)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        messages = create.call_args.kwargs["messages"]
+        prompt_bytes = sum(
+            len(message["content"].encode("utf-8"))
+            for message in messages
+        )
+        self.assertLessEqual(prompt_bytes, main.CLICK_PROMPT_MAX_BYTES)
+        context = self.prompt_context(create)
+        self.assertLessEqual(
+            len(context["visible_text"].encode("utf-8")),
+            main.CLICK_VISIBLE_TEXT_MAX_BYTES,
+        )
+        self.assertTrue(context["visible_text"].endswith("..."))
+
+    def test_large_candidate_list_keeps_exact_match_and_preserves_target_id(self):
+        page = {
+            **self.page,
+            "interactive_elements": [
+                {
+                    "index": index,
+                    "target_id": target_id(index + 400),
+                    "type": "a",
+                    "label": "Profile" if index == 0 else f"Unrelated link {index}",
+                    "accessible_name": "Profile" if index == 0 else f"Unrelated link {index}",
+                    "href": f"https://example.test/page/{index}",
+                    "visible": True,
+                    "disabled": False,
+                }
+                for index in range(60)
+            ],
+        }
+        selected_target_id = target_id(400)
+        proposal = {
+            "target_id": selected_target_id,
+            "ambiguous": False,
+            "action_description": "Open the Profile link.",
+            "expected_outcome": "The profile page opens.",
+        }
+        with patch.object(
+            main.client.chat.completions,
+            "create",
+            return_value=groq_response(json.dumps(proposal)),
+        ) as create:
+            response = self.post_click_plan(
+                instruction="Open Profile",
+                page=page,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["target_id"], selected_target_id)
+        context = self.prompt_context(create)
+        self.assertLessEqual(
+            context["candidates_sent"],
+            main.CLICK_PROMPT_CANDIDATE_LIMIT,
+        )
+        self.assertEqual(
+            [candidate["target_id"] for candidate in context["eligible_elements"]],
+            [selected_target_id],
+        )
+
+    def test_candidate_context_fields_are_bounded_and_target_id_is_unchanged(self):
+        selected_target_id = target_id(600)
+        page = {
+            **self.page,
+            "interactive_elements": [
+                {
+                    "index": 0,
+                    "target_id": selected_target_id,
+                    "type": "a",
+                    "element_tag": "a" * 40,
+                    "accessible_role": "link",
+                    "label": "Profile",
+                    "accessible_name": "Profile " + "x" * 192,
+                    "href": "https://example.test/" + "p" * 900,
+                    "landmark_label": "Landmark " + "l" * 190,
+                    "ancestor_context": [
+                        "Ancestor " + str(index) + " " + "a" * 160
+                        for index in range(4)
+                    ],
+                    "visible": True,
+                    "disabled": False,
+                }
+            ],
+        }
+        proposal = {
+            "target_id": selected_target_id,
+            "ambiguous": False,
+            "action_description": "Open the Profile link.",
+            "expected_outcome": "The profile page opens.",
+        }
+        with patch.object(
+            main.client.chat.completions,
+            "create",
+            return_value=groq_response(json.dumps(proposal)),
+        ) as create:
+            response = self.post_click_plan(
+                instruction="Open Profile",
+                page=page,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        candidate = self.prompt_context(create)["eligible_elements"][0]
+        self.assertEqual(candidate["target_id"], selected_target_id)
+        self.assertLessEqual(len(candidate["element_type"]), 40)
+        self.assertLessEqual(len(candidate["accessible_name"]), 200)
+        self.assertLessEqual(len(candidate["href"]), 300)
+        self.assertLessEqual(len(candidate["landmark_label"]), 120)
+        self.assertLessEqual(len(candidate["ancestor_context"]), 2)
+        self.assertTrue(all(len(item) <= 100 for item in candidate["ancestor_context"]))
+        self.assertNotIn("text", candidate)
+        self.assertNotIn("type", candidate)
+
+    def test_too_many_exact_matches_are_not_truncated_into_false_clarity(self):
+        page = {
+            **self.page,
+            "interactive_elements": [
+                {
+                    "index": index,
+                    "target_id": target_id(index + 500),
+                    "type": "a",
+                    "label": "Settings",
+                    "accessible_name": "Settings",
+                    "href": f"https://example.test/settings/{index}",
+                    "visible": True,
+                    "disabled": False,
+                }
+                for index in range(main.CLICK_PROMPT_CANDIDATE_LIMIT + 1)
+            ],
+        }
+        with patch.object(main.client.chat.completions, "create") as create:
+            response = self.post_click_plan(
+                instruction="Open Settings",
+                page=page,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()["valid"])
+        self.assertIn("full plausible set", response.json()["rejection_reason"])
+        create.assert_not_called()
+
+    def test_groq_413_returns_structured_non_retryable_error(self):
+        request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+        provider_response = httpx.Response(413, request=request)
+        error = main.APIStatusError(
+            "Sensitive provider details",
+            response=provider_response,
+            body={"api_key": "must not be exposed"},
+        )
+        self.assert_provider_error(error, "request_too_large", False, 413)
+
+    def test_groq_429_returns_structured_retryable_error(self):
+        request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+        provider_response = httpx.Response(429, request=request)
+        error = main.RateLimitError(
+            "Sensitive rate-limit details",
+            response=provider_response,
+            body={"api_key": "must not be exposed"},
+        )
+        self.assert_provider_error(error, "rate_limited", True, 429)
+
+    def test_groq_authentication_failure_returns_structured_error(self):
+        request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+        provider_response = httpx.Response(401, request=request)
+        error = main.AuthenticationError(
+            "Sensitive authentication details",
+            response=provider_response,
+            body={"api_key": "must not be exposed"},
+        )
+        self.assert_provider_error(
+            error,
+            "provider_authentication_failed",
+            False,
+            502,
+        )
+
+    def test_groq_network_timeout_returns_structured_retryable_error(self):
+        request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+        error = main.APITimeoutError(request=request)
+        self.assert_provider_error(error, "provider_timeout", True, 504)
+
+    def test_groq_network_connection_failure_returns_structured_retryable_error(self):
+        request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+        error = main.APIConnectionError(
+            message="Sensitive connection details",
+            request=request,
+        )
+        self.assert_provider_error(error, "provider_unavailable", True, 502)
+
+    def test_unexpected_provider_response_returns_structured_error(self):
+        with patch.object(
+            main.client.chat.completions,
+            "create",
+            return_value=SimpleNamespace(choices=[]),
+        ):
+            response = self.post_click_plan()
+
+        self.assertEqual(response.status_code, 502, response.text)
+        self.assertEqual(response.json()["success"], False)
+        self.assertEqual(response.json()["error_code"], "invalid_provider_response")
+        self.assertTrue(response.json()["message"])
+        self.assertTrue(response.json()["retryable"])
+
+    def assert_provider_error(self, error, error_code, retryable, status_code):
+        with patch.object(
+            main.client.chat.completions,
+            "create",
+            side_effect=error,
+        ):
+            response = self.post_click_plan()
+
+        self.assertEqual(response.status_code, status_code, response.text)
+        payload = response.json()
+        self.assertEqual(
+            set(payload),
+            {"success", "error_code", "message", "retryable"},
+        )
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["error_code"], error_code)
+        self.assertTrue(payload["message"])
+        self.assertEqual(payload["retryable"], retryable)
+        self.assertNotIn("Sensitive", response.text)
+        self.assertNotIn("must not be exposed", response.text)
 
     def test_navigation_link_ranks_above_same_named_video_link_without_hiding_it(self):
         navigation_target = target_id(108)
@@ -613,6 +937,147 @@ class ClickAutomationPlanningTests(unittest.TestCase):
         self.assertEqual(ranked[0]["context_category"], "sidebar_navigation")
         self.assertEqual(ranked[1]["target_id"], target_id(111))
         self.assertEqual(ranked[1]["context_category"], "page_content")
+
+    def test_spatial_click_intent_separates_target_and_reference(self):
+        intent = main.parse_click_intent(
+            "Click the bell-shaped Notifications button in YouTube's top navigation bar, "
+            "immediately to the right of the Create button."
+        )
+
+        self.assertIn("notifications", intent["target_terms"])
+        self.assertNotIn("create", intent["target_terms"])
+        self.assertEqual(intent["reference_terms"], {"create"})
+        self.assertEqual(intent["relationship"], "right_of")
+
+    def test_spatial_relationship_phrases_rank_the_named_target_not_the_reference(self):
+        spatial_instructions = [
+            "Click Notifications to the left of Create",
+            "Click Notifications to the right of Create",
+            "Click Notifications above Create",
+            "Click Notifications below Create",
+            "Click Notifications next to Create",
+        ]
+        candidates = [
+            {
+                "target_id": target_id(140),
+                "accessible_name": "Create",
+                "text": "Create",
+                "href": None,
+                "landmark_label": "Top navigation",
+                "ancestor_context": ["navigation: Top navigation"],
+                "context_category": "navigation",
+                "accessible_role": "button",
+            },
+            {
+                "target_id": target_id(141),
+                "accessible_name": "Notifications",
+                "text": "Notifications",
+                "href": None,
+                "landmark_label": "Top navigation",
+                "ancestor_context": ["navigation: Top navigation"],
+                "context_category": "navigation",
+                "accessible_role": "button",
+            },
+        ]
+
+        for instruction in spatial_instructions:
+            with self.subTest(instruction=instruction):
+                ranked = main.rank_click_candidates(instruction, candidates)
+                self.assertEqual(
+                    [candidate["target_id"] for candidate in ranked],
+                    [target_id(141)],
+                )
+
+    def test_exact_accessible_name_outranks_partial_matches_and_keeps_exact_ambiguity(self):
+        candidates = [
+            {
+                "target_id": target_id(142),
+                "accessible_name": "Notifications alerts",
+                "text": "Notifications alerts",
+                "href": None,
+                "landmark_label": "Top navigation",
+                "ancestor_context": ["navigation: Top navigation"],
+                "context_category": "navigation",
+                "accessible_role": "button",
+            },
+            {
+                "target_id": target_id(143),
+                "accessible_name": "Notifications",
+                "text": "Notifications",
+                "href": None,
+                "landmark_label": "Top navigation",
+                "ancestor_context": ["navigation: Top navigation"],
+                "context_category": "navigation",
+                "accessible_role": "button",
+            },
+            {
+                "target_id": target_id(144),
+                "accessible_name": "Notifications",
+                "text": "Notifications",
+                "href": None,
+                "landmark_label": "Account menu",
+                "ancestor_context": ["navigation: Account menu"],
+                "context_category": "navigation",
+                "accessible_role": "button",
+            },
+        ]
+
+        ranked = main.rank_click_candidates(
+            "Click the bell-shaped Notifications button immediately to the right of Create",
+            candidates,
+        )
+
+        self.assertEqual(
+            [candidate["target_id"] for candidate in ranked],
+            [target_id(143), target_id(144)],
+        )
+
+    def test_shared_navigation_context_alone_does_not_make_a_candidate_plausible(self):
+        candidates = [
+            {
+                "target_id": target_id(145),
+                "accessible_name": "Explore",
+                "text": "Explore",
+                "href": "https://example.test/explore",
+                "landmark_label": "Top navigation",
+                "ancestor_context": ["navigation: Top navigation"],
+                "context_category": "navigation",
+                "accessible_role": "button",
+            },
+        ]
+
+        self.assertEqual(
+            main.rank_click_candidates("Click Notifications in the top navigation", candidates),
+            [],
+        )
+
+    def test_no_ranked_target_is_rejected_without_calling_groq(self):
+        page = {
+            **self.page,
+            "interactive_elements": [
+                {
+                    "index": 0,
+                    "target_id": target_id(146),
+                    "type": "button",
+                    "label": "Explore",
+                    "accessible_name": "Explore",
+                    "landmark_label": "Top navigation",
+                    "ancestor_context": ["navigation: Top navigation"],
+                    "visible": True,
+                    "disabled": False,
+                },
+            ],
+        }
+
+        with patch.object(main.client.chat.completions, "create") as create:
+            response = self.post_click_plan(
+                instruction="Click Notifications in the top navigation",
+                page=page,
+            )
+
+        self.assertFalse(response.json()["valid"])
+        self.assertIn("matches the requested target", response.json()["rejection_reason"])
+        create.assert_not_called()
 
     def test_equally_matching_links_remain_in_prompt_and_ambiguous_plan_is_rejected(self):
         page = {
@@ -883,6 +1348,21 @@ class ClickAutomationPlanningTests(unittest.TestCase):
             "expected_outcome": None,
             "rejection_reason": "There are multiple matching settings sections.",
         }
+        settings_page = {
+            **self.page,
+            "interactive_elements": [
+                {
+                    "index": index,
+                    "target_id": target_id(150 + index),
+                    "type": "button",
+                    "label": "Settings",
+                    "accessible_name": "Settings",
+                    "visible": True,
+                    "disabled": False,
+                }
+                for index in range(2)
+            ],
+        }
         with patch.object(
             main.client.chat.completions,
             "create",
@@ -890,6 +1370,7 @@ class ClickAutomationPlanningTests(unittest.TestCase):
         ):
             response = self.post_click_plan(
                 instruction="Open settings",
+                page=settings_page,
             )
 
         self.assertFalse(response.json()["valid"])
@@ -910,14 +1391,14 @@ class ClickAutomationPlanningTests(unittest.TestCase):
             return_value=groq_response(json.dumps(proposal)),
         ):
             response = self.post_click_plan(
-                instruction="Open the billing page",
+                instruction="Open the profile page",
             )
 
         self.assertFalse(response.json()["valid"])
         self.assertIsNone(response.json()["target_id"])
         self.assertIn("No matching link", response.json()["rejection_reason"])
 
-    def test_rejects_form_submission_control(self):
+    def test_form_submission_control_remains_unsupported_by_click_planning(self):
         submit_page = dict(self.page)
         submit_page["interactive_elements"] = [
             *self.page["interactive_elements"],
@@ -946,6 +1427,7 @@ class ClickAutomationPlanningTests(unittest.TestCase):
 
         self.assertFalse(response.json()["valid"])
         self.assertIn("Form submission", response.json()["rejection_reason"])
+        self.assertNotIn("action_policy", response.json())
 
 
 if __name__ == "__main__":

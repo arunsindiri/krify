@@ -497,9 +497,22 @@ askPageButton.addEventListener("click", async () => {
                     page: buildPagePayload(observation)
                 })
             });
-            const plan = await response.json();
             if (!response.ok) {
-                throw new Error(plan.detail || `Server returned status ${response.status}`);
+                const errorBody = await parseResponseJsonSafely(response);
+                throw new Error(
+                    getBackendErrorMessage(errorBody) ||
+                    `The server could not plan this action (status ${response.status}).`
+                );
+            }
+            const plan = await parseResponseJsonSafely(response);
+            if (!plan) {
+                throw new Error("The server returned an unreadable response. Please try again.");
+            }
+            if (plan.success === false) {
+                throw new Error(
+                    getBackendErrorMessage(plan) ||
+                    "The server could not plan this action. Please try again."
+                );
             }
             if (requestVersion !== clickPlanRequestVersion) {
                 return;
@@ -541,6 +554,25 @@ askPageButton.addEventListener("click", async () => {
                 updateClickControls();
             }
         }
+    }
+
+    async function parseResponseJsonSafely(response) {
+        try {
+            const body = await response.text();
+            return body ? JSON.parse(body) : null;
+        } catch {
+            return null;
+        }
+    }
+
+    function getBackendErrorMessage(body) {
+        if (typeof body?.message === "string" && body.message.trim()) {
+            return body.message.trim();
+        }
+        if (typeof body?.detail === "string" && body.detail.trim()) {
+            return body.detail.trim();
+        }
+        return null;
     }
 
     function validateClickPlanResponse(plan, observation) {

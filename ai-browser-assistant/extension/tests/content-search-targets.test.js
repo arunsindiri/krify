@@ -561,6 +561,29 @@ test("approved click dispatches a safe non-submit button", () => {
     assert.equal(element.clickCalls, 1);
 });
 
+test("approved click allows a form-less button with implicit submit type", () => {
+    const button = new FakeButton(null);
+    button.removeAttribute("type");
+    button.setAttribute("aria-label", "Notifications");
+    const { harness, message, element } = observeClickTarget(button);
+
+    const result = harness.send(message);
+
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(element.clickCalls, 1);
+});
+
+test("approved click allows a form-less button with explicit submit type", () => {
+    const button = new FakeButton(null);
+    button.setAttribute("aria-label", "Notifications");
+    const { harness, message, element } = observeClickTarget(button);
+
+    const result = harness.send(message);
+
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(element.clickCalls, 1);
+});
+
 test("approved click dispatches an anchor-backed navigation tab with a safe href", () => {
     const tab = new FakeElement("a", null, {
         href: "/settings",
@@ -673,7 +696,7 @@ test("approved click rejects stale, hidden, and disabled targets", () => {
     assert.equal(disabled.element.clickCalls, 0);
 });
 
-test("approved click rejects identity changes, destructive targets, and form submits", () => {
+test("approved click rejects identity changes, destructive targets, and associated form submits", () => {
     const changed = observeClickTarget(new FakeButton(null));
     changed.element.setAttribute("type", "button");
     changed.element.setAttribute("aria-label", "Different action");
@@ -698,12 +721,20 @@ test("approved click rejects identity changes, destructive targets, and form sub
     assert.match(submitResult.error, /form submission/i);
     assert.equal(submitButton.clickCalls, 0);
 
-    const unattachedSubmitButton = new FakeButton(null);
-    const unattachedSubmit = observeClickTarget(unattachedSubmitButton);
-    const unattachedSubmitResult = unattachedSubmit.harness.send(unattachedSubmit.message);
-    assert.equal(unattachedSubmitResult.ok, false);
-    assert.match(unattachedSubmitResult.error, /form submission/i);
-    assert.equal(unattachedSubmitButton.clickCalls, 0);
+});
+
+test("approved click rejects input submit and image controls associated with forms", () => {
+    for (const inputType of ["submit", "image"]) {
+        const input = new FakeElement("input", new FakeForm(), { type: inputType });
+        input.type = inputType;
+        input.setAttribute("aria-label", `Submit ${inputType}`);
+        const { harness, message, element } = observeClickTarget(input);
+
+        const result = harness.send(message);
+
+        assert.equal(result.ok, false);
+        assert.equal(element.clickCalls, 0);
+    }
 });
 
 test("approved click rejects unsafe or changed link destinations", () => {

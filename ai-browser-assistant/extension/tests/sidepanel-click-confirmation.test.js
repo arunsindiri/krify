@@ -54,17 +54,22 @@ function validPlan(overrides = {}) {
     };
 }
 
-function response(data, ok = true) {
+function response(data, ok = true, rawBody = null, status = ok ? 200 : 502) {
     return {
         ok,
+        status,
         async json() {
             return data;
+        },
+        async text() {
+            return rawBody === null ? JSON.stringify(data) : rawBody;
         }
     };
 }
 
 function loadClickPanel({
     plan = validPlan(),
+    planResponse = null,
     planPromise = null,
     clickResponse = {
         ok: true,
@@ -144,7 +149,7 @@ function loadClickPanel({
         calls.fetches.push(url);
         calls.requests.push({ url, options });
         if (url.endsWith("/click-plan")) {
-            return planPromise || response(plan);
+            return planPromise || planResponse || response(plan);
         }
         throw new Error(`Unexpected request ${url}`);
     };
@@ -230,6 +235,69 @@ test("invalid plans and target IDs not present in the observation are rejected",
     await preparePlan(unknownTarget);
     assert.equal(unknownTarget.elements.get("clickConfirmation").hidden, true);
     assert.match(unknownTarget.elements.get("clickResult").textContent, /not in the current page observation/i);
+});
+
+test("click plans without an action policy preserve the existing confirmation UI", async () => {
+    const panel = loadClickPanel({ plan: validPlan() });
+    await preparePlan(panel);
+
+    assert.equal(panel.elements.get("clickConfirmation").hidden, false);
+    assert.equal(
+        panel.elements.get("clickConfirmationAction").textContent,
+        "Open the preferences section."
+    );
+    assert.equal(panel.elements.get("confirmClick").disabled, false);
+});
+
+test("structured backend errors display their user-friendly message", async () => {
+    const panel = loadClickPanel({
+        planResponse: response({
+            success: false,
+            error_code: "rate_limited",
+            message: "The AI service is temporarily busy. Please try again later.",
+            retryable: true
+        }, false, null, 429)
+    });
+    await preparePlan(panel);
+
+    assert.equal(panel.elements.get("clickConfirmation").hidden, true);
+    assert.match(
+        panel.elements.get("clickResult").textContent,
+        /The AI service is temporarily busy\. Please try again later\./
+    );
+    assert.doesNotMatch(panel.elements.get("clickResult").textContent, /JSON|token/i);
+});
+
+test("non-JSON backend errors never expose JSON parsing exceptions", async () => {
+    const panel = loadClickPanel({
+        planResponse: response(null, false, "Internal Server Error", 500)
+    });
+    await preparePlan(panel);
+
+    assert.equal(panel.elements.get("clickConfirmation").hidden, true);
+    assert.match(
+        panel.elements.get("clickResult").textContent,
+        /server could not plan this action \(status 500\)/i
+    );
+    assert.doesNotMatch(panel.elements.get("clickResult").textContent, /Unexpected token|JSON\.parse/i);
+});
+
+test("structured error bodies are handled even when the response status is successful", async () => {
+    const panel = loadClickPanel({
+        planResponse: response({
+            success: false,
+            error_code: "provider_unavailable",
+            message: "The AI service could not be reached. Try again shortly.",
+            retryable: true
+        })
+    });
+    await preparePlan(panel);
+
+    assert.equal(panel.elements.get("clickConfirmation").hidden, true);
+    assert.match(
+        panel.elements.get("clickResult").textContent,
+        /The AI service could not be reached\. Try again shortly\./
+    );
 });
 
 test("cancel dismisses the click confirmation without creating approval", async () => {

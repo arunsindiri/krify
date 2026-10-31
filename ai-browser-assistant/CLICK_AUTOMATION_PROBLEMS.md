@@ -81,3 +81,11 @@ This note summarizes the problems encountered while building Click Automation an
 **Solution:** Added uncertain-dispatch handling without automatic retries.
 
 **Example:** You click Shorts and YouTube starts navigating, but the response disappears. The extension reports that the click may have been dispatched instead of clicking again.
+
+## 11. Large Click-Planning Requests and Provider Errors
+
+**Problem:** Long page observations and many verbose candidates can exceed the Groq request budget. Provider failures could also appear as an unstructured server error in the Side Panel.
+
+**Solution:** Click planning limits visible text to 1,600 UTF-8 bytes, sends at most eight ranked plausible candidates, bounds candidate fields and context, and enforces a 6,000-byte combined prompt-content ceiling. Exact-name matches and close-ranked candidates are retained; if the full plausible set cannot fit the candidate limit, planning stops and asks the user to narrow the target rather than silently dropping candidates. Groq failures return structured, sanitized JSON errors, and the Side Panel handles both JSON and non-JSON responses without exposing parse errors.
+
+**Example:** Repeated "Settings" links remain ambiguous instead of being truncated to one candidate. A rate limit is reported as a retryable service message, without automatically retrying the request.
