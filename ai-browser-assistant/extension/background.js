@@ -1,6 +1,7 @@
 const ACTIVE_TAB_GRANT_KEY = "toolbarActiveTabGrant";
 const OBSERVATION_WATCHES_KEY = "pageObservationWatches";
-const automaticObservationRefreshes = new Set();
+const PAGE_CONTENT_CHANGE_DEBOUNCE_MS = 250;
+const automaticObservationRefreshes = new Map();
 
 chrome.action.onClicked.addListener((tab) => {
     if (!Number.isInteger(tab?.id)) {
@@ -41,6 +42,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
     clearToolbarGrant(tabId);
     clearObservationWatch(tabId);
+    clearObservationRefreshState(tabId);
 });
 
 chrome.tabs.onActivated.addListener((activeInfo) => {
@@ -73,6 +75,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 });
             });
 
+        return true;
+    }
+
+    if (message?.type === "PAGE_CONTENT_CHANGED") {
+        handlePageContentChanged(message, sender, sendResponse).catch((error) => {
+            console.error("Unable to process page content change notification", {
+                tabId: sender?.tab?.id,
+                error: error.message
+            });
+            sendResponse({ ok: false });
+        });
         return true;
     }
 
@@ -192,19 +205,123 @@ function invalidateTabObservation(tabId) {
     });
 }
 
-async function refreshObservedTab(tabId) {
-    if (automaticObservationRefreshes.has(tabId)) {
+function getAutomaticObservationRefreshState(tabId) {
+    let state = automaticObservationRefreshes.get(tabId);
+    if (!state) {
+        state = {
+            timer: null,
+            refreshing: false,
+            refreshAgain: false,
+            invalidatedSinceRefresh: false,
+            pendingResponses: []
+        };
+        automaticObservationRefreshes.set(tabId, state);
+    }
+    return state;
+}
+
+function clearObservationRefreshState(tabId) {
+    const state = automaticObservationRefreshes.get(tabId);
+    if (state && state.timer !== null) {
+        clearTimeout(state.timer);
+    }
+    state?.pendingResponses.forEach(sendResponse => sendResponse({ ok: false }));
+    automaticObservationRefreshes.delete(tabId);
+}
+
+async function handlePageContentChanged(message, sender, sendResponse) {
+    const tabId = sender?.tab?.id;
+    if (
+        sender?.id !== chrome.runtime.id ||
+        !Number.isInteger(tabId) ||
+        sender.frameId !== 0 ||
+        typeof sender.url !== "string" ||
+        typeof sender.tab?.url !== "string" ||
+        typeof message.url !== "string"
+    ) {
+        sendResponse({ ok: false });
         return;
     }
 
-    automaticObservationRefreshes.add(tabId);
+    const reportedUrl = parsePageUrl(message.url);
+    const senderUrl = parsePageUrl(sender.url);
+    const senderTabUrl = parsePageUrl(sender.tab.url);
+    if (
+        !reportedUrl ||
+        !senderUrl ||
+        !senderTabUrl ||
+        senderUrl.href !== reportedUrl.href ||
+        senderTabUrl.href !== reportedUrl.href
+    ) {
+        sendResponse({ ok: false });
+        return;
+    }
+
+    const [stored, tab, focusedActiveTabs] = await Promise.all([
+        chrome.storage.session.get(OBSERVATION_WATCHES_KEY),
+        chrome.tabs.get(tabId),
+        chrome.tabs.query({ active: true, lastFocusedWindow: true })
+    ]);
+    const watch = stored[OBSERVATION_WATCHES_KEY]?.[tabId];
+    const currentUrl = parsePageUrl(tab.url);
+    if (
+        !watch ||
+        tab.active !== true ||
+        focusedActiveTabs[0]?.id !== tabId ||
+        !currentUrl ||
+        currentUrl.href !== reportedUrl.href ||
+        currentUrl.origin !== watch.origin ||
+        senderUrl.origin !== watch.origin
+    ) {
+        sendResponse({ ok: false });
+        return;
+    }
+
+    const state = getAutomaticObservationRefreshState(tabId);
+    if (!state.invalidatedSinceRefresh) {
+        invalidateTabObservation(tabId);
+        state.invalidatedSinceRefresh = true;
+    }
+
+    state.pendingResponses.push(sendResponse);
+    if (state.refreshing) {
+        state.refreshAgain = true;
+        return;
+    }
+
+    if (state.timer !== null) {
+        clearTimeout(state.timer);
+    }
+    state.timer = setTimeout(() => {
+        state.timer = null;
+        void refreshObservedTab(tabId);
+    }, PAGE_CONTENT_CHANGE_DEBOUNCE_MS);
+}
+
+async function refreshObservedTab(tabId) {
+    const state = getAutomaticObservationRefreshState(tabId);
+    if (state.refreshing) {
+        return;
+    }
+
+    if (state.timer !== null) {
+        clearTimeout(state.timer);
+        state.timer = null;
+    }
+    state.refreshing = true;
+    state.invalidatedSinceRefresh = false;
     try {
-        const [stored, activeTab] = await Promise.all([
+        const [stored, activeTab, focusedActiveTabs] = await Promise.all([
             chrome.storage.session.get(OBSERVATION_WATCHES_KEY),
-            chrome.tabs.get(tabId)
+            chrome.tabs.get(tabId),
+            chrome.tabs.query({ active: true, lastFocusedWindow: true })
         ]);
         const watch = stored[OBSERVATION_WATCHES_KEY]?.[tabId];
-        if (!watch || activeTab.active === false) {
+        if (
+            !watch ||
+            activeTab.active === false ||
+            focusedActiveTabs[0]?.id !== tabId
+        ) {
             return;
         }
 
@@ -252,7 +369,18 @@ async function refreshObservedTab(tabId) {
             error: `Unable to refresh webpage observation: ${error.message}`
         });
     } finally {
-        automaticObservationRefreshes.delete(tabId);
+        state.refreshing = false;
+        if (state.refreshAgain) {
+            state.refreshAgain = false;
+            await refreshObservedTab(tabId);
+            return;
+        }
+
+        state.invalidatedSinceRefresh = false;
+        const responses = state.pendingResponses.splice(0);
+        for (const sendResponse of responses) {
+            sendResponse({ ok: true });
+        }
     }
 }
 

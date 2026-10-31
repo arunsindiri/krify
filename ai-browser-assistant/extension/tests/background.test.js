@@ -11,6 +11,7 @@ function loadBackground({
     scriptInjectionError,
     scriptInjectionErrorAfter,
     hostPermissionGranted = false,
+    tabMessageHandler,
     tabMessageResponse = {
         observation: {
             title: "Test page",
@@ -23,14 +24,17 @@ function loadBackground({
     const tabUpdatedListeners = [];
     const tabRemovedListeners = [];
     const tabActivatedListeners = [];
+    const pendingTimers = new Map();
     const calls = {
         panelOpen: [],
         scriptInjection: [],
         tabMessages: [],
         tabUpdates: [],
         runtimeMessages: [],
-        sessionStorage: {}
+        sessionStorage: {},
+        pendingTimers
     };
+    let nextTimerId = 1;
 
     const chrome = {
         action: {
@@ -41,6 +45,7 @@ function loadBackground({
             }
         },
         runtime: {
+            id: "test-extension-id",
             onMessage: {
                 addListener(listener) {
                     messageListeners.push(listener);
@@ -74,7 +79,7 @@ function loadBackground({
                 }
             },
             async query() {
-                return [activeTab];
+                return activeTab.active === false ? [] : [activeTab];
             },
             async get(tabId) {
                 assert.equal(tabId, activeTab.id);
@@ -89,7 +94,9 @@ function loadBackground({
                 if (message.type === "INVALIDATE_SEARCH_TARGETS") {
                     return { ok: true };
                 }
-                return tabMessageResponse;
+                return tabMessageHandler
+                    ? tabMessageHandler(tabId, message, calls.tabMessages.length)
+                    : tabMessageResponse;
             }
         },
         storage: {
@@ -133,7 +140,15 @@ function loadBackground({
     vm.runInNewContext(source, {
         chrome,
         console,
-        URL
+        URL,
+        setTimeout(callback) {
+            const timerId = nextTimerId++;
+            pendingTimers.set(timerId, callback);
+            return timerId;
+        },
+        clearTimeout(timerId) {
+            pendingTimers.delete(timerId);
+        }
     });
 
     return {
@@ -142,7 +157,24 @@ function loadBackground({
         tabActivatedListeners,
         tabRemovedListeners,
         tabUpdatedListeners,
-        toolbarClickListeners
+        toolbarClickListeners,
+        async flushTimers() {
+            while (pendingTimers.size) {
+                const callbacks = Array.from(pendingTimers.values());
+                pendingTimers.clear();
+                callbacks.forEach(callback => callback());
+                for (let turn = 0; turn < 4; turn += 1) {
+                    await new Promise(resolve => setImmediate(resolve));
+                }
+            }
+        },
+        runNextTimer() {
+            const [timerId, callback] = pendingTimers.entries().next().value || [];
+            if (callback) {
+                pendingTimers.delete(timerId);
+                callback();
+            }
+        }
     };
 }
 
@@ -153,6 +185,40 @@ function sendRuntimeMessage(messageListeners, message) {
             resolve(undefined);
         }
     });
+}
+
+function sendContentMessage(messageListeners, message, sender) {
+    return new Promise((resolve) => {
+        const keepChannelOpen = messageListeners[0](message, sender, resolve);
+        if (!keepChannelOpen) {
+            resolve(undefined);
+        }
+    });
+}
+
+async function observeWatchedTab(messageListeners, tab) {
+    const response = await sendRuntimeMessage(messageListeners, {
+        type: "OBSERVE_ACTIVE_TAB",
+        tabId: tab.id,
+        expectedOrigin: new URL(tab.url).origin
+    });
+    assert.equal(response.ok, true);
+}
+
+function contentChangeSender(tab) {
+    return {
+        id: "test-extension-id",
+        url: tab.url,
+        frameId: 0,
+        tab: { id: tab.id, url: tab.url }
+    };
+}
+
+function pageContentChangedMessage(tab) {
+    return {
+        type: "PAGE_CONTENT_CHANGED",
+        url: tab.url
+    };
 }
 
 test("search execution forwards opaque target IDs to the content script", async () => {
@@ -276,6 +342,237 @@ test("reload refreshes observation only for a watched active page with existing 
     assert.equal(
         calls.tabMessages.some(({ message }) => message.type === "EXECUTE_SEARCH"),
         false
+    );
+});
+
+test("valid page content change refreshes a watched active tab and notifies the Side Panel", async () => {
+    const activeTab = { id: 65, windowId: 7, url: "https://example.test/" };
+    const { calls, messageListeners, flushTimers } = loadBackground({
+        activeTab,
+        hostPermissionGranted: true,
+        tabMessageResponse: {
+            observation: {
+                title: "Updated page",
+                url: activeTab.url,
+                visibleText: "New content"
+            }
+        }
+    });
+    await observeWatchedTab(messageListeners, activeTab);
+
+    const responsePromise = sendContentMessage(
+        messageListeners,
+        pageContentChangedMessage(activeTab),
+        contentChangeSender(activeTab)
+    );
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(calls.pendingTimers.size, 1);
+    assert.equal(
+        calls.runtimeMessages.some(message => message.type === "PAGE_OBSERVATION_INVALIDATED"),
+        true
+    );
+
+    await flushTimers();
+    assert.equal((await responsePromise).ok, true);
+    assert.equal(
+        calls.runtimeMessages.some(message =>
+            message.type === "PAGE_OBSERVATION_UPDATED" &&
+            message.observation.visibleText === "New content"
+        ),
+        true
+    );
+    assert.equal(
+        calls.tabMessages.filter(({ message }) => message.type === "OBSERVE_PAGE").length,
+        2
+    );
+});
+
+test("page content changes from an unwatched tab are rejected", async () => {
+    const activeTab = { id: 66, windowId: 7, url: "https://example.test/" };
+    const { calls, messageListeners } = loadBackground({
+        activeTab,
+        hostPermissionGranted: true
+    });
+
+    const response = await sendContentMessage(
+        messageListeners,
+        pageContentChangedMessage(activeTab),
+        contentChangeSender(activeTab)
+    );
+
+    assert.equal(response.ok, false);
+    assert.equal(calls.pendingTimers.size, 0);
+    assert.equal(calls.scriptInjection.length, 0);
+});
+
+test("page content changes require a top-frame message from this extension", async () => {
+    const activeTab = { id: 71, windowId: 7, url: "https://example.test/" };
+    const { calls, messageListeners } = loadBackground({
+        activeTab,
+        hostPermissionGranted: true
+    });
+    await observeWatchedTab(messageListeners, activeTab);
+
+    const invalidSender = contentChangeSender(activeTab);
+    invalidSender.id = "different-extension";
+    const response = await sendContentMessage(
+        messageListeners,
+        pageContentChangedMessage(activeTab),
+        invalidSender
+    );
+
+    assert.equal(response.ok, false);
+    assert.equal(calls.pendingTimers.size, 0);
+});
+
+test("page content changes from an inactive watched tab are rejected", async () => {
+    const activeTab = { id: 67, windowId: 7, url: "https://example.test/" };
+    const { calls, messageListeners } = loadBackground({
+        activeTab,
+        hostPermissionGranted: true
+    });
+    await observeWatchedTab(messageListeners, activeTab);
+    activeTab.active = false;
+
+    const response = await sendContentMessage(
+        messageListeners,
+        pageContentChangedMessage(activeTab),
+        contentChangeSender(activeTab)
+    );
+
+    assert.equal(response.ok, false);
+    assert.equal(calls.pendingTimers.size, 0);
+    assert.equal(
+        calls.runtimeMessages.some(message => message.type === "PAGE_OBSERVATION_INVALIDATED"),
+        false
+    );
+});
+
+test("page content change rejects URL and authorized-origin mismatches", async () => {
+    const activeTab = { id: 68, windowId: 7, url: "https://example.test/" };
+    const { calls, messageListeners } = loadBackground({
+        activeTab,
+        hostPermissionGranted: true
+    });
+    await observeWatchedTab(messageListeners, activeTab);
+
+    const mismatchedReport = await sendContentMessage(
+        messageListeners,
+        { type: "PAGE_CONTENT_CHANGED", url: "https://example.test/other" },
+        contentChangeSender(activeTab)
+    );
+    assert.equal(mismatchedReport.ok, false);
+
+    activeTab.url = "https://other.example/";
+    const mismatchedOrigin = await sendContentMessage(
+        messageListeners,
+        pageContentChangedMessage(activeTab),
+        contentChangeSender(activeTab)
+    );
+    assert.equal(mismatchedOrigin.ok, false);
+    assert.equal(calls.pendingTimers.size, 0);
+});
+
+test("repeated page content notifications are debounced and coalesced", async () => {
+    const activeTab = { id: 69, windowId: 7, url: "https://example.test/" };
+    const { calls, messageListeners, flushTimers } = loadBackground({
+        activeTab,
+        hostPermissionGranted: true
+    });
+    await observeWatchedTab(messageListeners, activeTab);
+
+    const responses = [
+        sendContentMessage(messageListeners, pageContentChangedMessage(activeTab), contentChangeSender(activeTab)),
+        sendContentMessage(messageListeners, pageContentChangedMessage(activeTab), contentChangeSender(activeTab)),
+        sendContentMessage(messageListeners, pageContentChangedMessage(activeTab), contentChangeSender(activeTab))
+    ];
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(calls.pendingTimers.size, 1);
+    assert.equal(
+        calls.runtimeMessages.filter(message => message.type === "PAGE_OBSERVATION_INVALIDATED").length,
+        1
+    );
+
+    await flushTimers();
+    assert.deepEqual(
+        (await Promise.all(responses)).map(response => response.ok),
+        [true, true, true]
+    );
+    assert.equal(
+        calls.tabMessages.filter(({ message }) => message.type === "OBSERVE_PAGE").length,
+        2
+    );
+});
+
+test("overlapping refreshes are prevented and changes during refresh cause one final refresh", async () => {
+    const activeTab = { id: 70, windowId: 7, url: "https://example.test/" };
+    let releaseSlowRefresh;
+    const slowRefresh = new Promise(resolve => {
+        releaseSlowRefresh = resolve;
+    });
+    let observationCalls = 0;
+    let activeRefreshes = 0;
+    let maximumConcurrentRefreshes = 0;
+    const { calls, messageListeners, runNextTimer } = loadBackground({
+        activeTab,
+        hostPermissionGranted: true,
+        tabMessageHandler(tabId, message) {
+            if (message.type !== "OBSERVE_PAGE") {
+                return { ok: true };
+            }
+            observationCalls += 1;
+            activeRefreshes += 1;
+            maximumConcurrentRefreshes = Math.max(
+                maximumConcurrentRefreshes,
+                activeRefreshes
+            );
+            const response = observationCalls === 2
+                ? slowRefresh
+                : Promise.resolve({
+                    observation: {
+                        title: "Updated page",
+                        url: activeTab.url
+                    }
+                });
+            return response.finally(() => {
+                activeRefreshes -= 1;
+            });
+        }
+    });
+    await observeWatchedTab(messageListeners, activeTab);
+
+    const firstNotification = sendContentMessage(
+        messageListeners,
+        pageContentChangedMessage(activeTab),
+        contentChangeSender(activeTab)
+    );
+    await new Promise(resolve => setImmediate(resolve));
+    runNextTimer();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(observationCalls, 2);
+
+    const duringRefresh = [
+        sendContentMessage(messageListeners, pageContentChangedMessage(activeTab), contentChangeSender(activeTab)),
+        sendContentMessage(messageListeners, pageContentChangedMessage(activeTab), contentChangeSender(activeTab))
+    ];
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(calls.pendingTimers.size, 0);
+
+    releaseSlowRefresh({
+        observation: {
+            title: "First refresh",
+            url: activeTab.url
+        }
+    });
+    for (let turn = 0; turn < 8; turn += 1) {
+        await new Promise(resolve => setImmediate(resolve));
+    }
+
+    assert.equal(observationCalls, 3);
+    assert.equal(maximumConcurrentRefreshes, 1);
+    assert.deepEqual(
+        (await Promise.all([firstNotification, ...duringRefresh])).map(response => response.ok),
+        [true, true, true]
     );
 });
 

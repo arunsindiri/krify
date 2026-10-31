@@ -7,9 +7,15 @@ if (!globalThis.aiBrowserTargetDocumentToken) {
 
 if (!globalThis.aiBrowserObserverInstalled) {
     globalThis.aiBrowserObserverInstalled = true;
+    let pageMutationObserver = null;
+    let pageChangeNotificationTimer = null;
+    let pageChangeMonitoringEnabled = false;
+    let lastObservedPageUrl = window.location.href;
+
     window.addEventListener("pagehide", () => {
         globalThis.aiBrowserSearchTargetStore.targets.clear();
     }, { once: true });
+    installPageUrlChangeListeners();
 
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (message?.type === "INVALIDATE_SEARCH_TARGETS") {
@@ -74,6 +80,7 @@ if (!globalThis.aiBrowserObserverInstalled) {
         const visibleText = document.body?.innerText || "";
         const interactiveElements = collectInteractiveElements();
         const searchResultEvidence = collectSearchResultEvidence();
+        startPageChangeMonitoring();
 
         sendResponse({
             observation: {
@@ -90,6 +97,223 @@ if (!globalThis.aiBrowserObserverInstalled) {
 
         return false;
     });
+
+    function installPageUrlChangeListeners() {
+        for (const methodName of ["pushState", "replaceState"]) {
+            const originalMethod = window.history?.[methodName];
+            if (typeof originalMethod !== "function") {
+                continue;
+            }
+
+            window.history[methodName] = function (...args) {
+                const previousUrl = window.location.href;
+                const result = Reflect.apply(originalMethod, this, args);
+                notifyIfPageUrlChanged(previousUrl);
+                return result;
+            };
+        }
+
+        window.addEventListener("popstate", () => notifyIfPageUrlChanged());
+        window.addEventListener("hashchange", () => notifyIfPageUrlChanged());
+        window.navigation?.addEventListener(
+            "currententrychange",
+            () => notifyIfPageUrlChanged()
+        );
+    }
+
+    function notifyIfPageUrlChanged(previousUrl = lastObservedPageUrl) {
+        const currentUrl = window.location.href;
+        if (currentUrl === previousUrl) {
+            return;
+        }
+
+        lastObservedPageUrl = currentUrl;
+        schedulePageContentChanged();
+    }
+
+    function startPageChangeMonitoring() {
+        if (pageChangeMonitoringEnabled || typeof MutationObserver !== "function") {
+            return;
+        }
+
+        const observationRoot = document.documentElement || document.body;
+        if (!observationRoot) {
+            return;
+        }
+
+        lastObservedPageUrl = window.location.href;
+        pageMutationObserver = new MutationObserver(handlePageMutations);
+        pageMutationObserver.observe(observationRoot, {
+            attributes: true,
+            attributeFilter: [
+                "aria-disabled",
+                "aria-hidden",
+                "aria-label",
+                "aria-labelledby",
+                "autocomplete",
+                "disabled",
+                "formaction",
+                "formmethod",
+                "formtarget",
+                "formenctype",
+                "hidden",
+                "href",
+                "id",
+                "name",
+                "placeholder",
+                "role",
+                "title",
+                "type"
+            ],
+            attributeOldValue: true,
+            characterData: true,
+            characterDataOldValue: true,
+            childList: true,
+            subtree: true
+        });
+        pageChangeMonitoringEnabled = true;
+    }
+
+    function handlePageMutations(records) {
+        const changedAttributes = new Map();
+        const changedTextNodes = new Map();
+        const addedNodes = new Set();
+        const removedNodes = new Set();
+
+        for (const record of records) {
+            if (isInsideExtensionUi(record.target)) {
+                continue;
+            }
+
+            if (record.type === "attributes") {
+                let targetAttributes = changedAttributes.get(record.target);
+                if (!targetAttributes) {
+                    targetAttributes = new Map();
+                    changedAttributes.set(record.target, targetAttributes);
+                }
+                if (!targetAttributes.has(record.attributeName)) {
+                    targetAttributes.set(record.attributeName, record.oldValue);
+                }
+            } else if (record.type === "characterData") {
+                if (!changedTextNodes.has(record.target)) {
+                    changedTextNodes.set(record.target, record.oldValue);
+                }
+            } else if (record.type === "childList") {
+                for (const node of record.addedNodes) {
+                    addedNodes.add(node);
+                }
+                for (const node of record.removedNodes) {
+                    removedNodes.add(node);
+                }
+            }
+        }
+
+        for (const [element, attributes] of changedAttributes) {
+            if (!element.isConnected || isInsideExtensionUi(element)) {
+                continue;
+            }
+            for (const [attributeName, oldValue] of attributes) {
+                if (oldValue !== element.getAttribute(attributeName)) {
+                    schedulePageContentChanged();
+                    return;
+                }
+            }
+        }
+
+        for (const [textNode, oldValue] of changedTextNodes) {
+            if (
+                !isInsideExtensionUi(textNode) &&
+                oldValue !== textNode.nodeValue &&
+                (hasMeaningfulText(oldValue) || hasMeaningfulText(textNode.nodeValue))
+            ) {
+                schedulePageContentChanged();
+                return;
+            }
+        }
+
+        for (const node of addedNodes) {
+            if (
+                node.isConnected !== false &&
+                !isInsideExtensionUi(node) &&
+                hasMeaningfulPageContent(node)
+            ) {
+                schedulePageContentChanged();
+                return;
+            }
+        }
+
+        for (const node of removedNodes) {
+            if (
+                !addedNodes.has(node) &&
+                !isInsideExtensionUi(node) &&
+                hasMeaningfulPageContent(node)
+            ) {
+                schedulePageContentChanged();
+                return;
+            }
+        }
+    }
+
+    function hasMeaningfulPageContent(node) {
+        if (!node || isInsideExtensionUi(node)) {
+            return false;
+        }
+        if (node.nodeType === 3) {
+            return hasMeaningfulText(node.nodeValue);
+        }
+        if (node.nodeType !== 1) {
+            return false;
+        }
+
+        const tagName = node.tagName?.toLowerCase();
+        if (["script", "style", "noscript", "template"].includes(tagName)) {
+            return false;
+        }
+        if (node.matches?.(
+            'a[href], button, input, select, textarea, [role="button"], [role="link"], [role="searchbox"]'
+        )) {
+            return true;
+        }
+        return hasMeaningfulText(node.innerText || node.textContent);
+    }
+
+    function hasMeaningfulText(value) {
+        return typeof value === "string" && value.trim().length > 0;
+    }
+
+    function isInsideExtensionUi(node) {
+        let element = node?.nodeType === 1 ? node : node?.parentElement;
+        while (element) {
+            if (
+                element.id === "ai-browser-assistant-ui" ||
+                typeof element.getAttribute === "function" &&
+                element.getAttribute("data-ai-browser-assistant-ui") !== null
+            ) {
+                return true;
+            }
+            element = element.parentElement;
+        }
+        return false;
+    }
+
+    function schedulePageContentChanged() {
+        if (!pageChangeMonitoringEnabled) {
+            return;
+        }
+        if (pageChangeNotificationTimer !== null) {
+            window.clearTimeout(pageChangeNotificationTimer);
+        }
+
+        pageChangeNotificationTimer = window.setTimeout(() => {
+            pageChangeNotificationTimer = null;
+            void chrome.runtime.sendMessage({
+                type: "PAGE_CONTENT_CHANGED",
+                url: window.location.href
+            }).catch(error => {
+                console.debug("Page content change notification was unavailable:", error.message);
+            });
+        }, 250);
+    }
 }
 
 function collectInteractiveElements() {

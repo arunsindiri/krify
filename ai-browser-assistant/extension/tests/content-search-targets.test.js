@@ -25,6 +25,7 @@ class FakeForm {
 class FakeElement {
     constructor(tagName, form, attributes = {}) {
         this.tagName = tagName.toUpperCase();
+        this.nodeType = 1;
         this.form = form;
         this.attributes = new Map(Object.entries(attributes));
         this.disabled = false;
@@ -55,7 +56,13 @@ class FakeElement {
     }
 
     matches(selector) {
-        return selector === ":disabled" && this.disabled;
+        if (selector === ":disabled") {
+            return this.disabled;
+        }
+        return selector.split(", ").some(candidate =>
+            candidate === this.tagName.toLowerCase() ||
+            candidate === `[role="${this.getAttribute("role")}"]`
+        );
     }
 
     dispatchEvent(event) {
@@ -116,12 +123,20 @@ function createHarness() {
     const listeners = [];
     const errors = [];
     const windowListeners = [];
+    const navigationListeners = [];
+    const mutationObservers = [];
+    const pendingTimers = new Map();
+    const runtimeMessages = [];
+    let nextTimerId = 1;
+    let window;
     const document = {
         body: { innerText: "Search courses" },
         get forms() {
             return Array.from(new Set(candidates.map(element => element.form).filter(Boolean)));
         },
         documentElement: {
+            nodeType: 1,
+            tagName: "HTML",
             contains(element) {
                 return element.isConnected;
             }
@@ -133,11 +148,30 @@ function createHarness() {
             return [];
         }
     };
-    const window = {
+    window = {
         location: {
             href: "https://www.udemy.com/courses/search/?q=python",
             protocol: "https:",
             origin: "https://www.udemy.com"
+        },
+        history: {
+            pushState(state, title, url) {
+                if (url !== undefined && url !== null) {
+                    window.location.href = new URL(url, window.location.href).href;
+                }
+                return state;
+            },
+            replaceState(state, title, url) {
+                if (url !== undefined && url !== null) {
+                    window.location.href = new URL(url, window.location.href).href;
+                }
+                return state;
+            }
+        },
+        navigation: {
+            addEventListener(type, listener) {
+                navigationListeners.push({ type, listener });
+            }
         },
         getComputedStyle(element) {
             return {
@@ -148,6 +182,14 @@ function createHarness() {
         },
         addEventListener(type, listener, options) {
             windowListeners.push({ type, listener, options });
+        },
+        setTimeout(callback) {
+            const timerId = nextTimerId++;
+            pendingTimers.set(timerId, callback);
+            return timerId;
+        },
+        clearTimeout(timerId) {
+            pendingTimers.delete(timerId);
         }
     };
     const context = {
@@ -157,13 +199,35 @@ function createHarness() {
                     addListener(listener) {
                         listeners.push(listener);
                     }
+                },
+                sendMessage(message) {
+                    runtimeMessages.push(message);
+                    return Promise.resolve();
                 }
+            }
+        },
+        MutationObserver: class {
+            constructor(callback) {
+                this.callback = callback;
+                this.options = null;
+                this.target = null;
+                mutationObservers.push(this);
+            }
+
+            observe(target, options) {
+                this.target = target;
+                this.options = options;
+            }
+
+            trigger(records) {
+                this.callback(records);
             }
         },
         document,
         window,
         crypto: crypto.webcrypto,
         URL,
+        Reflect,
         Event: class {
             constructor(type, options) {
                 this.type = type;
@@ -177,6 +241,9 @@ function createHarness() {
         },
         console: {
             error(...args) {
+                errors.push(args);
+            },
+            debug(...args) {
                 errors.push(args);
             }
         }
@@ -222,11 +289,32 @@ function createHarness() {
             vm.runInContext(source, context);
         },
         windowListeners,
+        navigationListeners,
+        mutationObservers,
+        pendingTimers,
+        runtimeMessages,
         setCandidates(elements) {
             candidates = elements;
         },
         send,
-        context
+        context,
+        dispatchWindowEvent(type) {
+            for (const listener of windowListeners.filter(item => item.type === type)) {
+                listener.listener({ type });
+            }
+        },
+        dispatchNavigationEvent(type) {
+            for (const listener of navigationListeners.filter(item => item.type === type)) {
+                listener.listener({ type });
+            }
+        },
+        flushTimers() {
+            while (pendingTimers.size) {
+                const callbacks = Array.from(pendingTimers.values());
+                pendingTimers.clear();
+                callbacks.forEach(callback => callback());
+            }
+        }
     };
 }
 
@@ -346,6 +434,149 @@ test("a fresh observation includes dynamically added controls and replaces old t
         harness.context.aiBrowserSearchTargetStore.targets.has(previousTargetId),
         false
     );
+});
+
+test("meaningful text and interactive DOM changes emit lightweight notifications", () => {
+    const harness = createHarness();
+    const observer = harness.mutationObservers[0];
+    const textNode = {
+        nodeType: 3,
+        nodeValue: "Notifications",
+        parentElement: null
+    };
+    const button = new FakeButton(null);
+    button.setAttribute("type", "button");
+    button.textContent = "Notifications";
+
+    observer.trigger([{
+        type: "childList",
+        target: harness.document.documentElement,
+        addedNodes: [button],
+        removedNodes: []
+    }]);
+    harness.flushTimers();
+
+    assert.equal(harness.runtimeMessages.length, 1);
+    assert.deepEqual(
+        JSON.parse(JSON.stringify(harness.runtimeMessages[0])),
+        {
+            type: "PAGE_CONTENT_CHANGED",
+            url: harness.window.location.href
+        }
+    );
+    assert.equal("observation" in harness.runtimeMessages[0], false);
+
+    textNode.nodeValue = "Updated notifications";
+    observer.trigger([{
+        type: "characterData",
+        target: textNode,
+        oldValue: "Notifications"
+    }]);
+    harness.flushTimers();
+    assert.equal(harness.runtimeMessages.length, 2);
+});
+
+test("SPA history and popstate URL changes emit notifications", () => {
+    const harness = createHarness();
+    const initialUrl = harness.window.location.href;
+
+    harness.window.history.pushState({}, "", "/spa/push");
+    harness.flushTimers();
+    harness.window.history.replaceState({}, "", "/spa/replace");
+    harness.flushTimers();
+    harness.window.location.href = "https://www.udemy.com/spa/pop";
+    harness.dispatchWindowEvent("popstate");
+    harness.flushTimers();
+    harness.window.location.href = "https://www.udemy.com/spa/navigation-api";
+    harness.dispatchNavigationEvent("currententrychange");
+    harness.flushTimers();
+
+    assert.deepEqual(
+        harness.runtimeMessages.map(message => message.url),
+        [
+            "https://www.udemy.com/spa/push",
+            "https://www.udemy.com/spa/replace",
+            "https://www.udemy.com/spa/pop",
+            "https://www.udemy.com/spa/navigation-api"
+        ]
+    );
+    assert.notEqual(harness.runtimeMessages[0].url, initialUrl);
+});
+
+test("frequent meaningful mutations are debounced into one notification", () => {
+    const harness = createHarness();
+    const observer = harness.mutationObservers[0];
+    const firstText = { nodeType: 3, nodeValue: "First", parentElement: null };
+    const secondText = { nodeType: 3, nodeValue: "Second", parentElement: null };
+
+    observer.trigger([{
+        type: "characterData",
+        target: firstText,
+        oldValue: "Before"
+    }]);
+    observer.trigger([{
+        type: "characterData",
+        target: secondText,
+        oldValue: "Before"
+    }]);
+    observer.trigger([{
+        type: "characterData",
+        target: firstText,
+        oldValue: "Before"
+    }]);
+
+    assert.equal(harness.pendingTimers.size, 1);
+    harness.flushTimers();
+    assert.equal(harness.runtimeMessages.length, 1);
+});
+
+test("extension UI, temporary attributes, whitespace and unobserved attributes are ignored", () => {
+    const harness = createHarness();
+    const observer = harness.mutationObservers[0];
+    const originalLabel = new FakeButton(null);
+    originalLabel.setAttribute("aria-label", "Notifications");
+    const extensionUi = new FakeElement("div", null, {
+        "data-ai-browser-assistant-ui": ""
+    });
+    const extensionButton = new FakeButton(null);
+    extensionButton.textContent = "Assistant control";
+    extensionButton.parentElement = extensionUi;
+    const whitespaceNode = {
+        nodeType: 3,
+        nodeValue: "   ",
+        parentElement: null
+    };
+
+    observer.trigger([
+        {
+            type: "attributes",
+            target: originalLabel,
+            attributeName: "aria-label",
+            oldValue: "Notifications"
+        },
+        {
+            type: "attributes",
+            target: originalLabel,
+            attributeName: "aria-label",
+            oldValue: "Temporary"
+        },
+        {
+            type: "childList",
+            target: extensionUi,
+            addedNodes: [extensionButton],
+            removedNodes: []
+        },
+        {
+            type: "characterData",
+            target: whitespaceNode,
+            oldValue: ""
+        }
+    ]);
+    harness.flushTimers();
+
+    assert.equal(harness.runtimeMessages.length, 0);
+    assert.equal(observer.options.attributeFilter.includes("class"), false);
+    assert.equal(observer.options.attributeFilter.includes("style"), false);
 });
 
 test("execution rejects detached targets", () => {
@@ -490,7 +721,18 @@ test("pagehide discards target IDs and reinjection does not duplicate listeners"
     assert.match(result.error, /expired or is unavailable/i);
 
     harness.installAgain();
-    assert.equal(harness.windowListeners.length, 1);
+    assert.equal(
+        harness.windowListeners.filter(listener => listener.type === "pagehide").length,
+        1
+    );
+    assert.equal(
+        harness.windowListeners.filter(listener => listener.type === "popstate").length,
+        1
+    );
+    assert.equal(
+        harness.windowListeners.filter(listener => listener.type === "hashchange").length,
+        1
+    );
     assert.equal(harness.runtimeListenerCount(), 1);
 });
 
